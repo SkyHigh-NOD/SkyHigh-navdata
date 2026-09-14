@@ -382,16 +382,19 @@ def tagged_value(container, field: str):
     return None
 
 
+AD2_FILENAME_RE = re.compile(r"EG-AD-2\.([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
+
+
 def airport_icao_from_path(path: Path):
-    match = re.fullmatch(r"EG-AD-2\.([A-Z0-9]{4})-en-GB\.html", path.name.upper())
-    return match.group(1) if match else None
+    m = AD2_FILENAME_RE.fullmatch(path.name)
+    return m.group(1).upper() if m else None
 
 
 def find_ad2_html_files(html_dir: Path):
-    return sorted(
-        path for path in html_dir.rglob("EG-AD-2.*.html")
-        if airport_icao_from_path(path) is not None
-    )
+    all_ad2 = sorted(html_dir.rglob("EG-AD-2.*.html"))
+    valid = [p for p in all_ad2 if airport_icao_from_path(p) is not None]
+    log(f"Found {len(valid)} valid AD-2 HTML files (out of {len(all_ad2)} candidates).")
+    return valid
 
 
 def parse_ad_positions_html(html_dir: Path):
