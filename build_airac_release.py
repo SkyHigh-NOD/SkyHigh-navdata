@@ -8,6 +8,9 @@ The generated directory is suitable for review and manual Git commit:
         nav/
         ad/
         bg/
+          ENR2-1.lst, ENR2-1/*.draw   - FIR/UIR/TMA/CTA polygons, from ENR 2.1
+          <ICAO>.lst, <ICAO>/*.draw   - local CTR/ATZ/TMZ polygons per
+                                        airport, from each airport's AD 2.17
       manifest.json
 
 The script never commits or pushes to GitHub.
@@ -22,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -54,6 +58,21 @@ SD_PAIR_RE = re.compile(
     r'<span[^>]*class="sdParams"[^>]*>(?P<meta>.*?)</span>',
     re.DOTALL | re.IGNORECASE,
 )
+EARTH_RADIUS_NM = 3440.065
+# arcs (and full circles, e.g. an ATZ) get flattened to a polyline; one
+# vertex per this many degrees of sweep
+ARC_STEP_DEG = 1.0
+CIRCLE_POINTS = int(round(360 / ARC_STEP_DEG))
+AIRSPACE_COLOUR = "turquoise"
+# trailing tokens in an AD 2.17 airspace name that mark where the "type"
+# starts, e.g. "LONDON STANSTED TMZ 1" -> place word "STANSTED", type "TMZ 1"
+# - also used to keep the AIP's own abbreviations shouting when pretty-casing
+# names for both airspace builders
+AIRSPACE_TYPES = {
+    "CTR", "CTA", "ATZ", "TMA", "TMZ", "RMA", "MATZ", "TIZ", "TIA", "MTA",
+    "ADIZ", "FIZ", "FISZ", "AIAA", "TRA", "DANGER", "RESTRICTED",
+    "PROHIBITED", "GVS", "FIR", "UIR", "OCA", "ACC", "APP",
+}
 BAD_NAVPOINTS = {
     "AD", "AIP", "AIR", "AIRCRAFT", "AIRWAY", "AIRWAYS", "AIS", "AND",
     "APP", "APPROACH", "ARRIVAL", "ARRIVALS", "AT", "ATC", "ATIS", "ATS",
@@ -382,7 +401,9 @@ def tagged_value(container, field: str):
     return None
 
 
-AD2_FILENAME_RE = re.compile(r"EG-AD-2\.([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
+# NATS has shipped this filename with both "EG-AD-2.EGSS-..." and
+# "EG-AD-2_EGSS-..." separators across different AIRAC cycles - accept either.
+AD2_FILENAME_RE = re.compile(r"EG-AD-2[._-]([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
 
 
 def airport_icao_from_path(path: Path):
@@ -391,7 +412,9 @@ def airport_icao_from_path(path: Path):
 
 
 def find_ad2_html_files(html_dir: Path):
-    all_ad2 = sorted(html_dir.rglob("EG-AD-2.*.html"))
+    # the glob has to be loose enough to catch either separator; the regex
+    # above is what actually decides what counts as a valid AD-2 file
+    all_ad2 = sorted(html_dir.rglob("EG-AD-2*-en-GB*.html"))
     valid = [p for p in all_ad2 if airport_icao_from_path(p) is not None]
     log(f"Found {len(valid)} valid AD-2 HTML files (out of {len(all_ad2)} candidates).")
     return valid
@@ -535,6 +558,416 @@ def build_ad_entry_exit(html_dir: Path, output_nav: Path, airac_cycle: str) -> i
     return len(lines)
 
 
+\
+# ---------------------------------------------------------------------------
+# Airspace polygons (CONFIG/bg) - shared by both builders below.
+#
+# ENR 2.1 (FIR/UIR/TMA/CTA) and AD 2.17 (local CTR/ATZ/TMZ) lay their data
+# out differently - ENR 2.1 stacks name, lateral limits, vertical limits and
+# class as paragraphs in one table cell; AD 2.17 spreads them across three
+# columns instead - but the underlying vertex/arc markup and the polygon
+# math are identical, so that part lives here once.
+# ---------------------------------------------------------------------------
+
+def visible_text(node) -> str:
+    """Node's text with the hidden sdParams spans collapsed - BeautifulSoup's
+    get_text() ignores CSS, so 'display: none' spans have to be stripped
+    explicitly rather than relied on to stay invisible."""
+    html = re.sub(r'<span[^>]*class="sdParams"[^>]*>.*?</span>', "", str(node),
+                  flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", " ", html)
+    return re.sub(r"\s+", " ", TAG_RE.sub(" ", html)).strip()
+
+
+def parse_coord(value, is_lat: bool):
+    if not value:
+        return None
+    try:
+        return dms_to_decimal(value, is_lat)
+    except ValueError:
+        return None
+
+
+def bearing(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def destination(lat, lon, brg, dist_nm):
+    ang = dist_nm / EARTH_RADIUS_NM
+    p1 = math.radians(lat)
+    l1 = math.radians(lon)
+    b = math.radians(brg)
+    p2 = math.asin(math.sin(p1) * math.cos(ang) +
+                   math.cos(p1) * math.sin(ang) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(ang) * math.cos(p1),
+                         math.cos(ang) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540) % 360 - 180
+
+
+def arc_points(clat, clon, radius_nm, start, end, clockwise):
+    """Flatten an arc between two known boundary points into a polyline,
+    not including the endpoints themselves (the caller supplies those)."""
+    b1 = bearing(clat, clon, *start)
+    b2 = bearing(clat, clon, *end)
+    sweep = (b2 - b1) % 360 if clockwise else -((b1 - b2) % 360)
+    steps = max(int(abs(sweep) / ARC_STEP_DEG), 1)
+    return [destination(clat, clon, b1 + sweep * i / steps, radius_nm)
+            for i in range(1, steps)]
+
+
+def full_circle(clat, clon, radius_nm):
+    return [destination(clat, clon, 360 * i / CIRCLE_POINTS, radius_nm)
+            for i in range(CIRCLE_POINTS)]
+
+
+def vertex_sequence(paragraph):
+    """Walk a lateral-limits paragraph in document order, returning one dict
+    per vertex entity. The prose between the spans is what tells us an arc
+    is clockwise or anti-clockwise, so it's captured as we go. Works whether
+    the entity is a boundary point, an arc (adds radius/centre fields to the
+    point either side of it), or - as for an ATZ - a bare centre-and-radius
+    with no boundary point of its own."""
+    html = str(paragraph)
+    vertices = []
+    current = None
+    last_end = 0
+    for m in SD_PAIR_RE.finditer(html):
+        parts = clean(m.group("meta")).split(";")
+        if len(parts) != 3:
+            continue
+        table, field, entity_id = parts
+        if table != "TAIRSPACE_VERTEX":
+            continue
+        gap = visible_text(html[last_end:m.start()])
+        last_end = m.end()
+        val = clean(m.group("val"))
+
+        if current is None or current["id"] != entity_id:
+            current = {"id": entity_id}
+            vertices.append(current)
+        if field.startswith("ANNOTATION"):
+            continue
+        current[field] = val
+        if field == "VAL_RADIUS_ARC":
+            current["clockwise"] = "anti-clockwise" not in gap.lower()
+    return vertices
+
+
+def boundary(paragraph, name):
+    """Vertices -> list of (lat, lon). Arcs are expanded; a lone
+    centre+radius with no boundary points of its own (a plain circle, e.g.
+    an ATZ) is expanded into a full ring. The AIP's closing repeat of the
+    first vertex is dropped so each point appears once."""
+    verts = vertex_sequence(paragraph)
+    resolved = []
+    for v in verts:
+        lat = parse_coord(v.get("GEO_LAT"), True)
+        lon = parse_coord(v.get("GEO_LONG"), False)
+        if lat is not None and lon is not None:
+            resolved.append((lat, lon, v))
+
+    if not resolved:
+        for v in verts:
+            if "VAL_RADIUS_ARC" not in v or "GEO_LAT_ARC" not in v:
+                continue
+            clat = parse_coord(v.get("GEO_LAT_ARC"), True)
+            clon = parse_coord(v.get("GEO_LONG_ARC"), False)
+            try:
+                radius = float(v["VAL_RADIUS_ARC"])
+            except (TypeError, ValueError):
+                radius = None
+            if None in (clat, clon, radius):
+                continue
+            if v.get("UOM_RADIUS_ARC", "NM") != "NM":
+                log(f"WARNING: {name} circle radius is in "
+                    f"{v.get('UOM_RADIUS_ARC')}, skipping")
+                continue
+            return full_circle(clat, clon, radius)
+        return []
+
+    points = []
+    for i, (lat, lon, v) in enumerate(resolved):
+        points.append((lat, lon))
+        if "VAL_RADIUS_ARC" not in v or i + 1 >= len(resolved):
+            continue
+        clat = parse_coord(v.get("GEO_LAT_ARC"), True)
+        clon = parse_coord(v.get("GEO_LONG_ARC"), False)
+        try:
+            radius = float(v["VAL_RADIUS_ARC"])
+        except (TypeError, ValueError):
+            radius = None
+        if clat is None or clon is None or radius is None:
+            log(f"WARNING: {name} arc after {v.get('GEO_LAT')} "
+                f"{v.get('GEO_LONG')} is incomplete, drawing it straight")
+            continue
+        if v.get("UOM_RADIUS_ARC", "NM") != "NM":
+            log(f"WARNING: {name} arc radius is in "
+                f"{v.get('UOM_RADIUS_ARC')}, drawing it straight")
+            continue
+        nxt = resolved[i + 1]
+        points.extend(arc_points(clat, clon, radius, (lat, lon),
+                                 (nxt[0], nxt[1]), v.get("clockwise", True)))
+
+    if len(points) > 2 and points[0] == points[-1]:
+        points.pop()
+    return points
+
+
+def airspace_slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", name.upper()).strip("-")
+    return s or "UNNAMED"
+
+
+def airspace_pretty(words) -> str:
+    """Title-case the AIP's shouting, keeping known airspace abbreviations
+    (and any all-caps compass/UK/FL tokens) shouting."""
+    keep = AIRSPACE_TYPES | {"UK", "FL", "NORTH", "SOUTH", "EAST", "WEST"}
+    out = []
+    for w in words:
+        core = w.strip("(),")
+        out.append(w if core in keep or core.isdigit() else w.title())
+    return " ".join(out)
+
+
+def write_draw_file(path: Path, header_lines, points):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        for line in header_lines:
+            file.write(f"# {line}\n")
+        file.write(f"{AIRSPACE_COLOUR}\n")
+        for lat, lon in points:
+            file.write(f"{lat:.7f},{lon:.7f}\n")
+
+
+def write_lst_file(path: Path, entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        file.write("\n".join(entries))
+
+
+# --- ENR 2.1: FIR / UIR / TMA / CTA -----------------------------------------
+
+def enr_airspace_limits(cell):
+    """The 'Upper limit:' / 'Lower limit:' / 'Class:' lines from an ENR 2.1
+    cell, in AIP order. A few entries (the FIRs) stack several layers in one
+    cell, so this returns a flat list rather than a single triple."""
+    out = []
+    for p in cell.find_all("p"):
+        if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p):
+            continue
+        text = visible_text(p)
+        for label in ("Upper limit:", "Lower limit:", "Class:"):
+            if text.startswith(label):
+                value = re.sub(r"\s+", " ", text[len(label):]).strip()
+                value = re.sub(r"^FL\s+(\d)", r"FL\1", value)
+                out.append(f"{label.rstrip(':')}: {value}")
+                break
+    return out
+
+
+def build_enr_airspace_from_html(html_dir: Path, output_bg: Path, airac_cycle: str) -> int:
+    candidates = sorted(html_dir.rglob("EG-ENR-2.1-en-GB.html"))
+    if not candidates:
+        candidates = sorted(html_dir.rglob("*ENR-2.1*.html"))
+    if not candidates:
+        candidates = sorted(html_dir.rglob("*ENR-2-1*.html"))
+    if not candidates:
+        raise FileNotFoundError("No ENR 2.1 airspace HTML found in extracted AIRAC.")
+
+    source = candidates[0]
+    log(f"Using ENR 2.1 airspace file: {source.name}")
+    soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
+
+    group_dir = output_bg / "ENR2-1"
+    index, used, skipped, total_points = [], {}, 0, 0
+
+    for table in soup.find_all("table"):
+        for tbody in table.find_all("tbody", recursive=False):
+            for row in tbody.find_all("tr", recursive=False):
+                cell = row.find("td")
+                if cell is None:
+                    continue
+
+                name = None
+                for m in SD_PAIR_RE.finditer(str(cell)):
+                    parts = clean(m.group("meta")).split(";")
+                    if len(parts) == 3 and parts[0] == "TAIRSPACE" and parts[1] == "TXT_NAME":
+                        name = clean(m.group("val"))
+                        break
+                if not name:
+                    continue
+
+                lateral = next((p for p in cell.find_all("p")
+                               if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p)), None)
+                if lateral is None:
+                    log(f"WARNING: {name} has no lateral limits, skipping")
+                    skipped += 1
+                    continue
+
+                points = boundary(lateral, name)
+                if len(points) < 3:
+                    log(f"WARNING: {name} resolved to {len(points)} point(s), skipping")
+                    skipped += 1
+                    continue
+
+                stem = airspace_slug(name)
+                used[stem] = used.get(stem, 0) + 1
+                if used[stem] > 1:
+                    stem = f"{stem}-{used[stem]}"
+                filename = f"{stem}.draw"
+
+                header = [name, *enr_airspace_limits(cell)]
+                header.append(f"Data cycle {airac_cycle}, build "
+                              f"{datetime.now().strftime('%Y%m%d')}, generated "
+                              f"from UK eAIP ENR 2.1")
+
+                write_draw_file(group_dir / filename, header, points)
+                total_points += len(points)
+                index.append(f"ENR2-1/{filename}  DRAW  {airspace_pretty(name.split())}")
+
+    if not index:
+        raise RuntimeError("No airspace extracted from ENR 2.1.")
+
+    write_lst_file(output_bg / "ENR2-1.lst", index)
+    log(f"Wrote {len(index)} ENR 2.1 airspace file(s) ({total_points} points), skipped {skipped}")
+    return len(index)
+
+
+# --- AD 2.17: local CTR / ATZ / TMZ, one .lst per airport -------------------
+
+def ad_split_type(name: str):
+    """('STANSTED', ['CTR']) for 'LONDON STANSTED CTR' - the word right
+    before the recognised type token(s), and the type token(s) themselves.
+    Falls back to (whole name, []) if no known type token is found."""
+    words = name.split()
+    for i, w in enumerate(words):
+        if w.rstrip(",") in AIRSPACE_TYPES:
+            return (words[i - 1] if i > 0 else ""), words[i:]
+    return name, []
+
+
+def ad_vertical_limits(cell):
+    """[(upper, lower), ...] in document order, from an AD 2.17 'Vertical
+    Limits' column cell."""
+    pairs, upper = [], None
+    for p in cell.find_all("p"):
+        text = visible_text(p)
+        if text.startswith("Upper limit:"):
+            upper = re.sub(r"^FL\s+(\d)", r"FL\1", text[len("Upper limit:"):].strip())
+        elif text.startswith("Lower limit:") and upper is not None:
+            lower = re.sub(r"^FL\s+(\d)", r"FL\1", text[len("Lower limit:"):].strip())
+            pairs.append((upper, lower))
+            upper = None
+    return pairs
+
+
+def ad_class_values(cell):
+    """['D', ...] in document order, from an AD 2.17 'Airspace Class' column cell."""
+    return [visible_text(p) for p in cell.find_all("p") if visible_text(p)]
+
+
+def build_ad_local_airspace_from_html(html_dir: Path, output_bg: Path, airac_cycle: str) -> int:
+    total_files = 0
+    build_date = datetime.now().strftime("%Y%m%d")
+
+    for source in find_ad2_html_files(html_dir):
+        icao = airport_icao_from_path(source)
+        if not icao:
+            continue
+
+        soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
+        section = soup.find("div", id=f"{icao}-AD-2.17")
+        table = section.find("table") if section else None
+        if table is None:
+            continue  # this airport's AIP entry has no ATS-airspace table
+
+        tbodies = table.find_all("tbody", recursive=False)
+        if not tbodies:
+            continue
+
+        airport_dir = output_bg / icao
+        index, used, skipped, total_points = [], {}, 0, 0
+
+        for row in tbodies[0].find_all("tr", recursive=False):
+            cells = row.find_all("td", recursive=False)
+            if len(cells) < 3:
+                continue
+
+            name = None
+            for m in SD_PAIR_RE.finditer(str(cells[0])):
+                parts = clean(m.group("meta")).split(";")
+                if len(parts) == 3 and parts[0] == "TAIRSPACE" and parts[1] == "TXT_NAME":
+                    name = clean(m.group("val"))
+                    break
+            if not name:
+                log(f"WARNING: {icao} has an AD 2.17 row with no name "
+                    f"(possible continuation row), skipping")
+                skipped += 1
+                continue
+
+            lateral = next((p for p in cells[0].find_all("p") if "TAIRSPACE_VERTEX;" in str(p)), None)
+            if lateral is None:
+                log(f"WARNING: {icao} {name} has no lateral limits, skipping")
+                skipped += 1
+                continue
+
+            points = boundary(lateral, f"{icao} {name}")
+            if len(points) < 3:
+                log(f"WARNING: {icao} {name} resolved to {len(points)} point(s), skipping")
+                skipped += 1
+                continue
+
+            limit_pairs = ad_vertical_limits(cells[1])
+            classes = ad_class_values(cells[2])
+            if limit_pairs and classes and len(limit_pairs) != len(classes):
+                log(f"WARNING: {icao} {name} has {len(limit_pairs)} vertical "
+                    f"layer(s) but {len(classes)} class value(s)")
+
+            place, type_words = ad_split_type(name)
+            if type_words:
+                stem = f"{icao}-{airspace_slug(' '.join(type_words))}"
+                friendly = airspace_pretty(([place] if place else []) + type_words)
+            else:
+                stem = f"{icao}-{airspace_slug(name)}"
+                friendly = airspace_pretty(name.split())
+
+            used[stem] = used.get(stem, 0) + 1
+            if used[stem] > 1:
+                stem = f"{stem}-{used[stem]}"
+            filename = f"{stem}.draw"
+
+            header = [name]
+            for i, (upper, lower) in enumerate(limit_pairs):
+                header.append(f"Upper limit: {upper}")
+                header.append(f"Lower limit: {lower}")
+                if i < len(classes):
+                    header.append(f"Class: {classes[i]}")
+            if not limit_pairs:
+                header.extend(f"Class: {c}" for c in classes)
+            header.append(f"Data cycle {airac_cycle}, build {build_date}, "
+                          f"generated from UK eAIP {icao} AD 2.17")
+
+            write_draw_file(airport_dir / filename, header, points)
+            total_points += len(points)
+            index.append(f"{icao}/{filename}  DRAW  {friendly}")
+
+        if not index:
+            continue
+
+        write_lst_file(output_bg / f"{icao}.lst", index)
+        log(f"{icao}: wrote {len(index)} local airspace file(s) "
+            f"({total_points} points), skipped {skipped}")
+        total_files += len(index)
+
+    if total_files == 0:
+        raise RuntimeError("No local airspace extracted from any airport's AD 2.17.")
+    return total_files
+
+
 def gateway_json(path: str):
     url = "%s/%s" % (GATEWAY_API_BASE.rstrip("/"), path.lstrip("/"))
     with urlopen(request_url(url), timeout=60) as response:
@@ -656,6 +1089,8 @@ def create_release(airac: str, output_dir: Path) -> None:
         airway_count = build_airways_from_html(eaip_root, nav_root, airac)
         aerodrome_count = build_ad_positions(eaip_root, nav_root)
         entry_exit_count = build_ad_entry_exit(eaip_root, nav_root, airac)
+        enr_airspace_count = build_enr_airspace_from_html(eaip_root, bg_root, airac)
+        ad_airspace_count = build_ad_local_airspace_from_html(eaip_root, bg_root, airac)
 
     codes = gateway_airport_codes()
     log(f"Found {len(codes)} EG airport codes on X-Plane Gateway")
@@ -675,6 +1110,8 @@ def create_release(airac: str, output_dir: Path) -> None:
             "airway_segments": airway_count,
             "aerodrome_positions": aerodrome_count,
             "entry_exit_records": entry_exit_count,
+            "enr_airspace_pieces": enr_airspace_count,
+            "ad_local_airspace_pieces": ad_airspace_count,
             "gateway_layouts": gateway_downloads,
         },
     }
