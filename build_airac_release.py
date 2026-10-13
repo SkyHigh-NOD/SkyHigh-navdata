@@ -8,6 +8,9 @@ The generated directory is suitable for review and manual Git commit:
         nav/
         ad/
         bg/
+          ENR2-1.lst, ENR2-1/*.draw   - FIR/UIR/TMA/CTA polygons, from ENR 2.1
+          <ICAO>.lst, <ICAO>/*.draw   - local CTR/ATZ/TMZ polygons per
+                                        airport, from each airport's AD 2.17
       manifest.json
 
 The script never commits or pushes to GitHub.
@@ -21,11 +24,14 @@ Dependencies:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
 import re
 import shutil
 import tempfile
 import warnings
+from io import BytesIO
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +60,27 @@ SD_PAIR_RE = re.compile(
     r'<span[^>]*class="sdParams"[^>]*>(?P<meta>.*?)</span>',
     re.DOTALL | re.IGNORECASE,
 )
+EARTH_RADIUS_NM = 3440.065
+# arcs (and full circles, e.g. an ATZ) get flattened to a polyline; one
+# vertex per this many degrees of sweep
+ARC_STEP_DEG = 1.0
+CIRCLE_POINTS = int(round(360 / ARC_STEP_DEG))
+AIRSPACE_COLOUR = "turquoise"
+# AD 2.19 rows are id'd like "LOC_321", "GP_320", "VORDME_120", "DME_320" -
+# map that prefix onto the same nav_kind vocabulary NAV_TYPES already uses
+AD219_ROW_PREFIX_TO_KIND = {
+    "LOC": "ILSLOC", "GP": "ILSGP", "DME": "DME", "VORDME": "VORDME",
+    "VOR": "VOR", "NDB": "NDB", "TACAN": "DME",
+}
+# trailing tokens in an AD 2.17 airspace name that mark where the "type"
+# starts, e.g. "LONDON STANSTED TMZ 1" -> place word "STANSTED", type "TMZ 1"
+# - also used to keep the AIP's own abbreviations shouting when pretty-casing
+# names for both airspace builders
+AIRSPACE_TYPES = {
+    "CTR", "CTA", "ATZ", "TMA", "TMZ", "RMA", "MATZ", "TIZ", "TIA", "MTA",
+    "ADIZ", "FIZ", "FISZ", "AIAA", "TRA", "DANGER", "RESTRICTED",
+    "PROHIBITED", "GVS", "FIR", "UIR", "OCA", "ACC", "APP",
+}
 BAD_NAVPOINTS = {
     "AD", "AIP", "AIR", "AIRCRAFT", "AIRWAY", "AIRWAYS", "AIS", "AND",
     "APP", "APPROACH", "ARRIVAL", "ARRIVALS", "AT", "ATC", "ATIS", "ATS",
@@ -161,12 +188,17 @@ def segment_limits(row):
     return None
 
 
+def find_enr_html(html_dir: Path, section: str):
+    """ENR section files, e.g. section '4.1'. NATS names these with a dot
+    ('EG-ENR-4.1-en-GB.html') in some downloads and an underscore
+    ('EG-ENR-4_1-en-GB.html') in others, so accept any of . _ -"""
+    major, minor = section.split(".")
+    pattern = re.compile(rf"ENR-{major}[._-]{minor}(?!\d)", re.I)
+    return sorted(p for p in html_dir.rglob("*ENR-*.html") if pattern.search(p.name))
+
+
 def build_airways_from_html(html_dir: Path, output_nav: Path, airac_cycle: str) -> int:
-    candidates = sorted(html_dir.rglob("EG-ENR-3.2-en-GB.html"))
-    if not candidates:
-        candidates = sorted(html_dir.rglob("*ENR-3.2*.html"))
-    if not candidates:
-        candidates = sorted(html_dir.rglob("*ENR-3-2*.html"))
+    candidates = find_enr_html(html_dir, "3.2")
     if not candidates:
         raise FileNotFoundError("No ENR 3.2 ATS routes HTML found in extracted AIRAC.")
 
@@ -262,7 +294,7 @@ def parse_fixes_html(source: Path):
 
 
 def build_fixes_from_html(html_dir: Path, output_nav: Path) -> int:
-    candidates = sorted(html_dir.rglob("*ENR-4.4*.html"))
+    candidates = find_enr_html(html_dir, "4.4")
     if not candidates:
         raise FileNotFoundError("No ENR 4.4 significant-points HTML found in extracted AIRAC.")
 
@@ -284,6 +316,128 @@ def build_fixes_from_html(html_dir: Path, output_nav: Path) -> int:
     return len(fixes)
 
 
+FREQ_WITH_UNIT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(MHz|kHz)", re.I)
+FREQ_BARE_VHF_RE = re.compile(r"\b(\d{2,3}\.\d{1,3})\b")
+
+
+def normalise_frequency(raw) -> str:
+    """'114.550 MHz' -> '114.550'; anything without a number -> '0'."""
+    cleaned = re.sub(r"[^0-9.]", "", raw or "")
+    return cleaned if re.search(r"\d", cleaned) else "0"
+
+
+def frequency_from_text(text: str):
+    """First plausible frequency in free text. A unit-tagged number wins
+    (so a DME channel like '92Y' is never mistaken for one); otherwise a
+    bare VHF-style decimal such as 114.550."""
+    m = FREQ_WITH_UNIT_RE.search(text or "")
+    if m:
+        return m.group(1)
+    m = FREQ_BARE_VHF_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def column_positions(cells):
+    """Start column index of each cell, accounting for colspan."""
+    positions, col = [], 0
+    for cell in cells:
+        positions.append(col)
+        try:
+            col += max(int(cell.get("colspan", 1)), 1)
+        except ValueError:
+            col += 1
+    return positions
+
+
+def header_column(table, needle: str):
+    """Column index of the first header cell whose text contains `needle`."""
+    if table is None:
+        return None
+    thead = table.find("thead")
+    header_rows = thead.find_all("tr", recursive=False) if thead else table.find_all("tr", limit=2)
+    for tr in header_rows:
+        cells = tr.find_all(["th", "td"], recursive=False)
+        for pos, cell in zip(column_positions(cells), cells):
+            if needle.lower() in visible_text(cell).lower():
+                return pos
+    return None
+
+
+def frequency_from_row(row):
+    """Frequency read straight from the row's visible text, independent of
+    the SD/sdParams tagging: the 'Frequency' column if the table has one,
+    otherwise anywhere in the row. Used when VAL_FREQ isn't tagged where we
+    expect it - the number is always printed in the table either way."""
+    cells = row.find_all("td", recursive=False)
+    column = header_column(row.find_parent("table"), "freq")
+    if column is not None and cells:
+        for pos, cell in zip(column_positions(cells), cells):
+            if pos == column:
+                return frequency_from_text(visible_text(cell))
+        return None
+    return frequency_from_text(visible_text(row))
+
+
+DME_CHANNEL_RE = re.compile(r"^(\d{1,3})([XY])$", re.I)
+
+
+def dme_channel_to_frequency(channel):
+    """VHF frequency paired with a DME channel (ICAO Annex 10 pairing), as
+    '113.600', or None. Last resort for a DME that prints only a channel
+    and no frequency (e.g. London DME: 83X = 113.60 MHz)."""
+    m = DME_CHANNEL_RE.match((channel or "").strip())
+    if not m:
+        return None
+    number, mode = int(m.group(1)), m.group(2).upper()
+    if 17 <= number <= 59:
+        base = 108.00 + (number - 17) * 0.1
+    elif 60 <= number <= 69:
+        base = 133.30 + (number - 60) * 0.1
+    elif 70 <= number <= 126:
+        base = 112.30 + (number - 70) * 0.1
+    else:
+        return None
+    return "%.3f" % (base + (0.05 if mode == "Y" else 0.0))
+
+
+def navaid_frequency(fields: dict, row) -> str:
+    """Best frequency for a navaid row, as a normalised string ('0' if
+    there really isn't one). In order:
+      VAL_FREQ        - VOR / NDB / ILS own frequency
+      VAL_GHOST_FREQ  - what a DME-only row tags its paired VHF frequency as
+      the printed Frequency column
+      the DME channel's paired frequency
+    """
+    for field in ("VAL_FREQ", "VAL_GHOST_FREQ"):
+        value = normalise_frequency(fields.get(field))
+        if value != "0":
+            return value
+    value = normalise_frequency(frequency_from_row(row))
+    if value != "0":
+        return value
+    return normalise_frequency(dme_channel_to_frequency(fields.get("CODE_CHANNEL")))
+
+
+def flatten_entity_fields(node):
+    """Every SD/sdParams field found anywhere under `node`, taking the first
+    value seen for each field name - regardless of which specific
+    sub-entity (e.g. TVOR vs TDME vs TNAVAID within one combined VOR/DME or
+    ILS/DME row) it belongs to. A combined row spreads its frequency,
+    channel, elevation and position across several different entity ids,
+    and those fields are complementary rather than conflicting, so folding
+    them into one dict is safe. This uses the same SD_PAIR_RE regex scan as
+    extract_entities() rather than a DOM sibling-walk: it's what every other
+    table in this file (airways, navaids, ENR 2.1, AD 2.17) is parsed with,
+    and unlike a sibling-walk it doesn't depend on the SD value span and its
+    sdParams span staying direct DOM siblings after BeautifulSoup builds the
+    tree - which is what was silently dropping VAL_FREQ for every navaid."""
+    fields = {}
+    for (_tag, _entity_id), values in extract_entities(node).items():
+        for field, vals in values.items():
+            fields.setdefault(field, vals[0])
+    return fields
+
+
 def parse_navaids_html(source: Path):
     soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
     records, seen = [], set()
@@ -295,21 +449,14 @@ def parse_navaids_html(source: Path):
             re.I,
         )
         if not match:
+            log(f"WARNING: ENR 4.1 row {row.get('id')} is not a recognised navaid kind, skipping")
             continue
         nav_kind, ident = match.groups()
         nav_kind, ident = nav_kind.upper(), ident.upper()
         if ident in seen:
             continue
 
-        fields = {}
-        for span in row.find_all("span", class_="SD"):
-            metadata = span.find_next_sibling("span", class_="sdParams")
-            if metadata is None:
-                continue
-            raw = metadata.get_text(" ", strip=True)
-            for field in ("VAL_FREQ", "GEO_LAT", "GEO_LONG", "VAL_ELEV", "TXT_NAME"):
-                if f";{field};" in raw:
-                    fields[field] = span.get_text(strip=True)
+        fields = flatten_entity_fields(row)
 
         if "GEO_LAT" not in fields or "GEO_LONG" not in fields:
             continue
@@ -323,8 +470,8 @@ def parse_navaids_html(source: Path):
             elevation = int(float(re.sub(r"[^0-9.-]", "", fields.get("VAL_ELEV", "0")) or 0))
         except ValueError:
             elevation = 0
-        frequency = re.sub(r"[^0-9.]", "", fields.get("VAL_FREQ", "0")) or "0"
-        if nav_kind in ("VOR", "VORDME") and "." not in frequency:
+        frequency = navaid_frequency(fields, row)
+        if frequency != "0" and nav_kind in ("VOR", "VORDME") and "." not in frequency:
             frequency += ".000"
 
         records.append(
@@ -336,6 +483,7 @@ def parse_navaids_html(source: Path):
                 "freq": frequency,
                 "ident": ident,
                 "name": fields.get("TXT_NAME", ident).strip() or ident,
+                "row_html": str(row) if frequency == "0" else "",
             }
         )
         seen.add(ident)
@@ -343,15 +491,19 @@ def parse_navaids_html(source: Path):
 
 
 def build_navaids_from_html(html_dir: Path, output_nav: Path, airac_cycle: str) -> int:
-    candidates = sorted(html_dir.rglob("EG-ENR-4.1-en-GB.html"))
-    if not candidates:
-        candidates = sorted(html_dir.rglob("*ENR-4.1*.html"))
+    candidates = find_enr_html(html_dir, "4.1")
     if not candidates:
         raise FileNotFoundError("No ENR 4.1 navaids HTML found in extracted AIRAC.")
 
     records = parse_navaids_html(candidates[0])
     if not records:
         raise RuntimeError("No navaids extracted from ENR 4.1.")
+
+    no_freq = [nav for nav in records if nav["freq"] == "0"]
+    if no_freq:
+        log(f"WARNING: {len(no_freq)} of {len(records)} ENR 4.1 navaids have no frequency "
+            f"(first: {no_freq[0]['ident']}). Row HTML for the first one:")
+        log(re.sub(r"\s+", " ", no_freq[0]["row_html"])[:1500])
 
     output_nav.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -382,7 +534,9 @@ def tagged_value(container, field: str):
     return None
 
 
-AD2_FILENAME_RE = re.compile(r"EG-AD-2\.([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
+# NATS has shipped this filename with both "EG-AD-2.EGSS-..." and
+# "EG-AD-2_EGSS-..." separators across different AIRAC cycles - accept either.
+AD2_FILENAME_RE = re.compile(r"EG-AD-2[._-]([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
 
 
 def airport_icao_from_path(path: Path):
@@ -391,7 +545,9 @@ def airport_icao_from_path(path: Path):
 
 
 def find_ad2_html_files(html_dir: Path):
-    all_ad2 = sorted(html_dir.rglob("EG-AD-2.*.html"))
+    # the glob has to be loose enough to catch either separator; the regex
+    # above is what actually decides what counts as a valid AD-2 file
+    all_ad2 = sorted(html_dir.rglob("EG-AD-2*-en-GB*.html"))
     valid = [p for p in all_ad2 if airport_icao_from_path(p) is not None]
     log(f"Found {len(valid)} valid AD-2 HTML files (out of {len(all_ad2)} candidates).")
     return valid
@@ -535,74 +691,691 @@ def build_ad_entry_exit(html_dir: Path, output_nav: Path, airac_cycle: str) -> i
     return len(lines)
 
 
+\
+# ---------------------------------------------------------------------------
+# Airspace polygons (CONFIG/bg) - shared by both builders below.
+#
+# ENR 2.1 (FIR/UIR/TMA/CTA) and AD 2.17 (local CTR/ATZ/TMZ) lay their data
+# out differently - ENR 2.1 stacks name, lateral limits, vertical limits and
+# class as paragraphs in one table cell; AD 2.17 spreads them across three
+# columns instead - but the underlying vertex/arc markup and the polygon
+# math are identical, so that part lives here once.
+# ---------------------------------------------------------------------------
+
+def visible_text(node) -> str:
+    """Node's text with the hidden sdParams spans collapsed - BeautifulSoup's
+    get_text() ignores CSS, so 'display: none' spans have to be stripped
+    explicitly rather than relied on to stay invisible."""
+    html = re.sub(r'<span[^>]*class="sdParams"[^>]*>.*?</span>', "", str(node),
+                  flags=re.DOTALL | re.IGNORECASE)
+    html = re.sub(r"<br\s*/?>", " ", html)
+    return re.sub(r"\s+", " ", TAG_RE.sub(" ", html)).strip()
+
+
+def parse_coord(value, is_lat: bool):
+    if not value:
+        return None
+    try:
+        return dms_to_decimal(value, is_lat)
+    except ValueError:
+        return None
+
+
+def bearing(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def destination(lat, lon, brg, dist_nm):
+    ang = dist_nm / EARTH_RADIUS_NM
+    p1 = math.radians(lat)
+    l1 = math.radians(lon)
+    b = math.radians(brg)
+    p2 = math.asin(math.sin(p1) * math.cos(ang) +
+                   math.cos(p1) * math.sin(ang) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(ang) * math.cos(p1),
+                         math.cos(ang) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540) % 360 - 180
+
+
+def arc_points(clat, clon, radius_nm, start, end, clockwise):
+    """Flatten an arc between two known boundary points into a polyline,
+    not including the endpoints themselves (the caller supplies those)."""
+    b1 = bearing(clat, clon, *start)
+    b2 = bearing(clat, clon, *end)
+    sweep = (b2 - b1) % 360 if clockwise else -((b1 - b2) % 360)
+    steps = max(int(abs(sweep) / ARC_STEP_DEG), 1)
+    return [destination(clat, clon, b1 + sweep * i / steps, radius_nm)
+            for i in range(1, steps)]
+
+
+def full_circle(clat, clon, radius_nm):
+    return [destination(clat, clon, 360 * i / CIRCLE_POINTS, radius_nm)
+            for i in range(CIRCLE_POINTS)]
+
+
+def vertex_sequence(paragraph):
+    """Walk a lateral-limits paragraph in document order, returning one dict
+    per vertex entity. The prose between the spans is what tells us an arc
+    is clockwise or anti-clockwise, so it's captured as we go. Works whether
+    the entity is a boundary point, an arc (adds radius/centre fields to the
+    point either side of it), or - as for an ATZ - a bare centre-and-radius
+    with no boundary point of its own."""
+    html = str(paragraph)
+    vertices = []
+    current = None
+    last_end = 0
+    for m in SD_PAIR_RE.finditer(html):
+        parts = clean(m.group("meta")).split(";")
+        if len(parts) != 3:
+            continue
+        table, field, entity_id = parts
+        if table != "TAIRSPACE_VERTEX":
+            continue
+        gap = visible_text(html[last_end:m.start()])
+        last_end = m.end()
+        val = clean(m.group("val"))
+
+        if current is None or current["id"] != entity_id:
+            current = {"id": entity_id}
+            vertices.append(current)
+        if field.startswith("ANNOTATION"):
+            continue
+        current[field] = val
+        if field == "VAL_RADIUS_ARC":
+            current["clockwise"] = "anti-clockwise" not in gap.lower()
+    return vertices
+
+
+def boundary(paragraph, name):
+    """Vertices -> list of (lat, lon). Arcs are expanded; a lone
+    centre+radius with no boundary points of its own (a plain circle, e.g.
+    an ATZ) is expanded into a full ring. The AIP's closing repeat of the
+    first vertex is dropped so each point appears once."""
+    verts = vertex_sequence(paragraph)
+    resolved = []
+    for v in verts:
+        lat = parse_coord(v.get("GEO_LAT"), True)
+        lon = parse_coord(v.get("GEO_LONG"), False)
+        if lat is not None and lon is not None:
+            resolved.append((lat, lon, v))
+
+    if not resolved:
+        for v in verts:
+            if "VAL_RADIUS_ARC" not in v or "GEO_LAT_ARC" not in v:
+                continue
+            clat = parse_coord(v.get("GEO_LAT_ARC"), True)
+            clon = parse_coord(v.get("GEO_LONG_ARC"), False)
+            try:
+                radius = float(v["VAL_RADIUS_ARC"])
+            except (TypeError, ValueError):
+                radius = None
+            if None in (clat, clon, radius):
+                continue
+            if v.get("UOM_RADIUS_ARC", "NM") != "NM":
+                log(f"WARNING: {name} circle radius is in "
+                    f"{v.get('UOM_RADIUS_ARC')}, skipping")
+                continue
+            return full_circle(clat, clon, radius)
+        return []
+
+    points = []
+    for i, (lat, lon, v) in enumerate(resolved):
+        points.append((lat, lon))
+        if "VAL_RADIUS_ARC" not in v or i + 1 >= len(resolved):
+            continue
+        clat = parse_coord(v.get("GEO_LAT_ARC"), True)
+        clon = parse_coord(v.get("GEO_LONG_ARC"), False)
+        try:
+            radius = float(v["VAL_RADIUS_ARC"])
+        except (TypeError, ValueError):
+            radius = None
+        if clat is None or clon is None or radius is None:
+            log(f"WARNING: {name} arc after {v.get('GEO_LAT')} "
+                f"{v.get('GEO_LONG')} is incomplete, drawing it straight")
+            continue
+        if v.get("UOM_RADIUS_ARC", "NM") != "NM":
+            log(f"WARNING: {name} arc radius is in "
+                f"{v.get('UOM_RADIUS_ARC')}, drawing it straight")
+            continue
+        nxt = resolved[i + 1]
+        points.extend(arc_points(clat, clon, radius, (lat, lon),
+                                 (nxt[0], nxt[1]), v.get("clockwise", True)))
+
+    if len(points) > 2 and points[0] == points[-1]:
+        points.pop()
+    return points
+
+
+def airspace_slug(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9]+", "-", name.upper()).strip("-")
+    return s or "UNNAMED"
+
+
+def airspace_pretty(words) -> str:
+    """Title-case the AIP's shouting, keeping known airspace abbreviations
+    (and any all-caps compass/UK/FL tokens) shouting."""
+    keep = AIRSPACE_TYPES | {"UK", "FL", "NORTH", "SOUTH", "EAST", "WEST"}
+    out = []
+    for w in words:
+        core = w.strip("(),")
+        out.append(w if core in keep or core.isdigit() else w.title())
+    return " ".join(out)
+
+
+def write_draw_file(path: Path, header_lines, points):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        for line in header_lines:
+            file.write(f"# {line}\n")
+        file.write(f"{AIRSPACE_COLOUR}\n")
+        for lat, lon in points:
+            file.write(f"{lat:.7f},{lon:.7f}\n")
+
+
+def write_lst_file(path: Path, entries):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        file.write("\n".join(entries))
+
+
+# --- ENR 2.1: FIR / UIR / TMA / CTA -----------------------------------------
+
+def enr_airspace_limits(cell):
+    """The 'Upper limit:' / 'Lower limit:' / 'Class:' lines from an ENR 2.1
+    cell, in AIP order. A few entries (the FIRs) stack several layers in one
+    cell, so this returns a flat list rather than a single triple."""
+    out = []
+    for p in cell.find_all("p"):
+        if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p):
+            continue
+        text = visible_text(p)
+        for label in ("Upper limit:", "Lower limit:", "Class:"):
+            if text.startswith(label):
+                value = re.sub(r"\s+", " ", text[len(label):]).strip()
+                value = re.sub(r"^FL\s+(\d)", r"FL\1", value)
+                out.append(f"{label.rstrip(':')}: {value}")
+                break
+    return out
+
+
+def build_enr_airspace_from_html(html_dir: Path, output_bg: Path, airac_cycle: str) -> int:
+    candidates = find_enr_html(html_dir, "2.1")
+    if not candidates:
+        raise FileNotFoundError("No ENR 2.1 airspace HTML found in extracted AIRAC.")
+
+    source = candidates[0]
+    log(f"Using ENR 2.1 airspace file: {source.name}")
+    soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
+
+    group_dir = output_bg / "ENR2-1"
+    index, used, skipped, total_points = [], {}, 0, 0
+
+    for table in soup.find_all("table"):
+        for tbody in table.find_all("tbody", recursive=False):
+            for row in tbody.find_all("tr", recursive=False):
+                cell = row.find("td")
+                if cell is None:
+                    continue
+
+                name = None
+                for m in SD_PAIR_RE.finditer(str(cell)):
+                    parts = clean(m.group("meta")).split(";")
+                    if len(parts) == 3 and parts[0] == "TAIRSPACE" and parts[1] == "TXT_NAME":
+                        name = clean(m.group("val"))
+                        break
+                if not name:
+                    continue
+
+                lateral = next((p for p in cell.find_all("p")
+                               if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p)), None)
+                if lateral is None:
+                    log(f"WARNING: {name} has no lateral limits, skipping")
+                    skipped += 1
+                    continue
+
+                points = boundary(lateral, name)
+                if len(points) < 3:
+                    log(f"WARNING: {name} resolved to {len(points)} point(s), skipping")
+                    skipped += 1
+                    continue
+
+                stem = airspace_slug(name)
+                used[stem] = used.get(stem, 0) + 1
+                if used[stem] > 1:
+                    stem = f"{stem}-{used[stem]}"
+                filename = f"{stem}.draw"
+
+                header = [name, *enr_airspace_limits(cell)]
+                header.append(f"Data cycle {airac_cycle}, build "
+                              f"{datetime.now().strftime('%Y%m%d')}, generated "
+                              f"from UK eAIP ENR 2.1")
+
+                write_draw_file(group_dir / filename, header, points)
+                total_points += len(points)
+                index.append(f"ENR2-1/{filename}  DRAW  {airspace_pretty(name.split())}")
+
+    if not index:
+        raise RuntimeError("No airspace extracted from ENR 2.1.")
+
+    write_lst_file(output_bg / "ENR2-1.lst", index)
+    log(f"Wrote {len(index)} ENR 2.1 airspace file(s) ({total_points} points), skipped {skipped}")
+    return len(index)
+
+
+# --- AD 2.17: local CTR / ATZ / TMZ, one .lst per airport -------------------
+
+def ad_split_type(name: str):
+    """('STANSTED', ['CTR']) for 'LONDON STANSTED CTR' - the word right
+    before the recognised type token(s), and the type token(s) themselves.
+    Falls back to (whole name, []) if no known type token is found."""
+    words = name.split()
+    for i, w in enumerate(words):
+        if w.rstrip(",") in AIRSPACE_TYPES:
+            return (words[i - 1] if i > 0 else ""), words[i:]
+    return name, []
+
+
+def ad_vertical_limits(cell):
+    """[(upper, lower), ...] in document order, from an AD 2.17 'Vertical
+    Limits' column cell."""
+    pairs, upper = [], None
+    for p in cell.find_all("p"):
+        text = visible_text(p)
+        if text.startswith("Upper limit:"):
+            upper = re.sub(r"^FL\s+(\d)", r"FL\1", text[len("Upper limit:"):].strip())
+        elif text.startswith("Lower limit:") and upper is not None:
+            lower = re.sub(r"^FL\s+(\d)", r"FL\1", text[len("Lower limit:"):].strip())
+            pairs.append((upper, lower))
+            upper = None
+    return pairs
+
+
+def ad_class_values(cell):
+    """['D', ...] in document order, from an AD 2.17 'Airspace Class' column cell."""
+    return [visible_text(p) for p in cell.find_all("p") if visible_text(p)]
+
+
+def build_ad_local_airspace_from_html(html_dir: Path, output_bg: Path, airac_cycle: str) -> int:
+    total_files = 0
+    build_date = datetime.now().strftime("%Y%m%d")
+
+    for source in find_ad2_html_files(html_dir):
+        icao = airport_icao_from_path(source)
+        if not icao:
+            continue
+
+        soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
+        section = soup.find("div", id=f"{icao}-AD-2.17")
+        table = section.find("table") if section else None
+        if table is None:
+            continue  # this airport's AIP entry has no ATS-airspace table
+
+        tbodies = table.find_all("tbody", recursive=False)
+        if not tbodies:
+            continue
+
+        airport_dir = output_bg / icao
+        index, used, skipped, total_points = [], {}, 0, 0
+
+        for row in tbodies[0].find_all("tr", recursive=False):
+            cells = row.find_all("td", recursive=False)
+            if len(cells) < 3:
+                continue
+
+            name = None
+            for m in SD_PAIR_RE.finditer(str(cells[0])):
+                parts = clean(m.group("meta")).split(";")
+                if len(parts) == 3 and parts[0] == "TAIRSPACE" and parts[1] == "TXT_NAME":
+                    name = clean(m.group("val"))
+                    break
+            if not name:
+                log(f"WARNING: {icao} has an AD 2.17 row with no name "
+                    f"(possible continuation row), skipping")
+                skipped += 1
+                continue
+
+            lateral = next((p for p in cells[0].find_all("p") if "TAIRSPACE_VERTEX;" in str(p)), None)
+            if lateral is None:
+                log(f"WARNING: {icao} {name} has no lateral limits, skipping")
+                skipped += 1
+                continue
+
+            points = boundary(lateral, f"{icao} {name}")
+            if len(points) < 3:
+                log(f"WARNING: {icao} {name} resolved to {len(points)} point(s), skipping")
+                skipped += 1
+                continue
+
+            limit_pairs = ad_vertical_limits(cells[1])
+            classes = ad_class_values(cells[2])
+            if limit_pairs and classes and len(limit_pairs) != len(classes):
+                log(f"WARNING: {icao} {name} has {len(limit_pairs)} vertical "
+                    f"layer(s) but {len(classes)} class value(s)")
+
+            place, type_words = ad_split_type(name)
+            if type_words:
+                stem = f"{icao}-{airspace_slug(' '.join(type_words))}"
+                friendly = airspace_pretty(([place] if place else []) + type_words)
+            else:
+                stem = f"{icao}-{airspace_slug(name)}"
+                friendly = airspace_pretty(name.split())
+
+            used[stem] = used.get(stem, 0) + 1
+            if used[stem] > 1:
+                stem = f"{stem}-{used[stem]}"
+            filename = f"{stem}.draw"
+
+            header = [name]
+            for i, (upper, lower) in enumerate(limit_pairs):
+                header.append(f"Upper limit: {upper}")
+                header.append(f"Lower limit: {lower}")
+                if i < len(classes):
+                    header.append(f"Class: {classes[i]}")
+            if not limit_pairs:
+                header.extend(f"Class: {c}" for c in classes)
+            header.append(f"Data cycle {airac_cycle}, build {build_date}, "
+                          f"generated from UK eAIP {icao} AD 2.17")
+
+            write_draw_file(airport_dir / filename, header, points)
+            total_points += len(points)
+            index.append(f"{icao}/{filename}  DRAW  {friendly}")
+
+        if not index:
+            continue
+
+        write_lst_file(output_bg / f"{icao}.lst", index)
+        log(f"{icao}: wrote {len(index)} local airspace file(s) "
+            f"({total_points} points), skipped {skipped}")
+        total_files += len(index)
+
+    if total_files == 0:
+        raise RuntimeError("No local airspace extracted from any airport's AD 2.17.")
+    return total_files
+
+
+# --- AD 2.19: local navaids (ILS LOC/GP, on-field DME, nearby VOR/NDB) -----
+
+# Fallback for rows whose row_id prefix isn't one we know: classify by the
+# printed "Type of Aid" text instead. Order matters (most specific first).
+AD219_LABEL_TO_KIND = (
+    ("VOR/DME", "VORDME"), ("VORTAC", "VORDME"), ("ILS/LOC", "ILSLOC"),
+    ("LOC", "ILSLOC"), ("ILS/GP", "ILSGP"), ("GP", "ILSGP"), ("GS", "ILSGP"),
+    ("ILS/DME", "DME"), ("TACAN", "DME"), ("DME", "DME"), ("VOR", "VOR"),
+    ("NDB", "NDB"), ("LOM", "NDB"), ("LMM", "NDB"),
+)
+
+
+def ad219_kind(row_id: str, type_label: str):
+    prefix = re.match(r"([A-Z]+)_\d+$", row_id or "", re.I)
+    if prefix and prefix.group(1).upper() in AD219_ROW_PREFIX_TO_KIND:
+        return AD219_ROW_PREFIX_TO_KIND[prefix.group(1).upper()]
+    label = type_label.upper()
+    for needle, kind in AD219_LABEL_TO_KIND:
+        if needle in label:
+            return kind
+    return None
+
+
+def build_ad_navaids_from_html(html_dir: Path, output_nav: Path, airac_cycle: str) -> int:
+    """One navaid.dat-style file per airport, from that airport's own AD
+    2.19 table. This mostly captures ILS localizers/glideslopes and on-field
+    DMEs that ENR 4.1's master navaid list doesn't carry (it's the enroute
+    significant-navaid list, not an approach-aid list) - VOR/NDBs referenced
+    from AD 2.19 as nearby aids are already in navaid.dat and will appear
+    again here too, scoped to whichever airport(s) list them."""
+    build_date = datetime.now().strftime("%Y%m%d")
+    output_dir = output_nav / "ad-navaids"
+    total_records = 0
+
+    for source in find_ad2_html_files(html_dir):
+        icao = airport_icao_from_path(source)
+        if not icao:
+            continue
+
+        soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
+        section = soup.find("div", id=f"{icao}-AD-2.19")
+        table = section.find("table") if section else None
+        if table is None:
+            continue  # this airport's AIP entry has no radio-navaid table
+
+        tbodies = table.find_all("tbody", recursive=False)
+        if not tbodies:
+            continue
+
+        ident_column = header_column(table, "ident")
+        records, seen = [], set()
+        for row in tbodies[0].find_all("tr", recursive=False):
+            cells = row.find_all("td", recursive=False)
+            if len(cells) < 5:
+                continue
+
+            row_id = row.get("row_id") or row.get("id") or ""
+            first_p = cells[0].find("p")
+            type_label = visible_text(first_p) if first_p else visible_text(cells[0])
+            nav_kind = ad219_kind(row.get("row_id") or "", type_label)
+            if not nav_kind:
+                log(f"WARNING: {icao} AD 2.19 row {row_id or '?'} "
+                    f"({type_label!r}) is not a recognised aid type, skipping")
+                continue
+            if row_id in seen:
+                continue
+
+            fields = flatten_entity_fields(row)
+
+            ident = (fields.get("CODE_ID") or "").strip().upper()
+            if not ident and ident_column is not None:
+                for pos, cell in zip(column_positions(cells), cells):
+                    if pos == ident_column:
+                        ident = visible_text(cell).strip().upper()
+            if not ident:
+                log(f"WARNING: {icao} AD 2.19 row {row_id or '?'} has no ident, skipping")
+                continue
+
+            if "GEO_LAT" not in fields or "GEO_LONG" not in fields:
+                log(f"WARNING: {icao} {ident} ({type_label}) has no position, skipping")
+                continue
+            try:
+                lat = dms_to_decimal(fields["GEO_LAT"], True)
+                lon = dms_to_decimal(fields["GEO_LONG"], False)
+            except ValueError:
+                log(f"WARNING: {icao} {ident} has an unreadable position, skipping")
+                continue
+
+            try:
+                elevation = int(float(re.sub(r"[^0-9.-]", "", fields.get("VAL_ELEV", "0")) or 0))
+            except ValueError:
+                elevation = 0
+
+            frequency = navaid_frequency(fields, row)
+            if frequency == "0":
+                log(f"WARNING: {icao} {ident} ({type_label}) has no frequency")
+            elif nav_kind in ("VOR", "VORDME") and "." not in frequency:
+                frequency += ".000"
+
+            name = f"{icao} {type_label} {ident}".strip()
+            records.append(
+                "%s %.6f %.6f %s %s 0 0 %s 0 %s %s"
+                % (NAV_TYPES.get(nav_kind, 2), lat, lon, elevation, frequency,
+                   ident, REGION, name)
+            )
+            seen.add(row_id)
+
+        if not records:
+            continue
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "I",
+            "1100 Version - data cycle %s, build %s, generated from UK eAIP %s AD 2.19"
+            % (airac_cycle, build_date, icao),
+            *records,
+            "99",
+        ]
+        (output_dir / f"{icao}.dat").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        log(f"{icao}: wrote {len(records)} AD 2.19 navaid(s)")
+        total_records += len(records)
+
+    return total_records
+
+
+def ci_get(mapping, *names, default=None):
+    """Case-insensitive lookup across several candidate key names - the
+    Gateway API has used both camelCase and PascalCase field names."""
+    if not isinstance(mapping, dict):
+        return default
+    lowered = {str(key).lower(): value for key, value in mapping.items()}
+    for name in names:
+        value = lowered.get(name.lower())
+        if value is not None:
+            return value
+    return default
+
+
 def gateway_json(path: str):
     url = "%s/%s" % (GATEWAY_API_BASE.rstrip("/"), path.lstrip("/"))
     with urlopen(request_url(url), timeout=60) as response:
         return json.loads(response.read().decode("utf-8", errors="replace"))
 
 
+def fetch_bytes(url: str, timeout: int = 120) -> bytes:
+    with urlopen(request_url(url), timeout=timeout) as response:
+        return response.read()
+
+
 def gateway_scenery_items(airport: dict):
-    for key in ("scenery", "sceneries", "sceneryPacks", "Scenery", "scenery_list", "scenery_list_items"):
-        if isinstance(airport.get(key), list):
-            return airport[key]
-    for wrapper in ("data", "airport"):
-        wrapped = airport.get(wrapper)
-        if isinstance(wrapped, dict):
-            for key in ("scenery", "sceneries", "sceneryPacks", "Scenery", "scenery_list", "scenery_list_items"):
-                if isinstance(wrapped.get(key), list):
-                    return wrapped[key]
+    keys = ("scenery", "sceneries", "sceneryPacks", "scenery_list", "scenery_list_items")
+    for container in (airport, ci_get(airport, "airport", "data")):
+        value = ci_get(container, *keys)
+        if isinstance(value, list):
+            return value
     return []
 
 
 def scenery_identifier(scenery: dict):
-    for key in ("sceneryId", "id", "SceneryID", "scenery_id", "sceneryIdStr", "idStr"):
-        if scenery.get(key) is not None:
-            return str(scenery[key])
-    return None
+    value = ci_get(scenery, "sceneryId", "scenery_id", "sceneryIdStr", "id", "idStr")
+    return str(value) if value is not None else None
+
+
+def gateway_pick_scenery_id(payload: dict):
+    """The airport's recommended scenery pack if it names one, otherwise the
+    newest approved pack, otherwise just the newest."""
+    for container in (ci_get(payload, "airport", "data"), payload):
+        recommended = ci_get(container, "recommendedSceneryId", "recommended_scenery_id")
+        if recommended:
+            return str(recommended)
+
+    items = [item for item in gateway_scenery_items(payload) if scenery_identifier(item)]
+    if not items:
+        return None
+
+    def sort_key(item):
+        approved = str(ci_get(item, "status", default="")).lower() == "approved"
+        stamp = str(ci_get(item, "dateApproved", "dateAccepted", "updatedAt", "createdAt", default=""))
+        return (approved, stamp)
+
+    return scenery_identifier(max(items, key=sort_key))
+
+
+APT_DAT_HEAD_RE = re.compile(r"^(?:1\s+-?\d+\s+[01]\s+[01]\s+\S+|1\d{3}\s+Version)", re.M)
+
+
+def extract_apt_dat(payload: bytes, icao: str):
+    """apt.dat text from a Gateway download, which is a zip holding the
+    airport's .dat (alongside a .txt of metadata). Returns None if the
+    payload is neither a zip with a .dat in it nor apt.dat text itself -
+    e.g. an HTML error page, which must not be saved as <ICAO>.dat."""
+    if payload[:2] == b"PK":
+        with ZipFile(BytesIO(payload)) as archive:
+            names = [n for n in archive.namelist() if n.lower().endswith(".dat") and not n.endswith("/")]
+            if not names:
+                return None
+            preferred = [n for n in names if Path(n).stem.upper() == icao.upper()]
+            return archive.read((preferred or names)[0]).decode("utf-8", errors="replace")
+    text = payload.decode("utf-8", errors="replace")
+    head = text[:4000]
+    if "<html" in head.lower() or not APT_DAT_HEAD_RE.search(head):
+        return None
+    return text
+
+
+def gateway_scenery_dat(icao: str, scenery_id: str):
+    # 1. API: /apiv1/scenery/<id> returns the pack as a base64 zip
+    #    ("masterZipBlob"), not a file download.
+    try:
+        payload = gateway_json("scenery/%s" % scenery_id)
+        record = ci_get(payload, "scenery", "data")
+        record = record if isinstance(record, dict) else payload
+        blob = ci_get(record, "masterZipBlob", "master_zip_blob", "zipBlob")
+        if blob:
+            text = extract_apt_dat(base64.b64decode(blob), icao)
+            if text:
+                return text
+            log(f"Gateway {icao}: scenery {scenery_id} blob held no usable .dat")
+        else:
+            log(f"Gateway {icao}: scenery {scenery_id} response had no zip blob "
+                f"(keys: {sorted(record)[:12]})")
+    except Exception as error:
+        log(f"Gateway {icao}: scenery API failed for {scenery_id}: {error}")
+
+    # 2. the old web download URL, but only accepted if it really is apt.dat
+    url = f"{GATEWAY_WEB_BASE}/airports/{icao}/scenery/{scenery_id}/download"
+    try:
+        return extract_apt_dat(fetch_bytes(url), icao)
+    except Exception as error:
+        log(f"Gateway {icao}: download fallback failed: {error}")
+        return None
 
 
 def write_gateway_layout(icao: str, output_path: Path) -> bool:
     try:
         airport = gateway_json("airport/%s" % icao)
     except HTTPError as error:
-        if error.code == 404:
-            return False
-        raise
+        if error.code != 404:
+            log(f"Gateway skipped {icao}: HTTP {error.code}")
+        return False
     except Exception as error:
         log(f"Gateway skipped {icao}: {error}")
         return False
 
-    scenery = [item for item in gateway_scenery_items(airport) if scenery_identifier(item)]
-    if not scenery:
-        return False
-    scenery.sort(key=lambda item: str(item.get("dateApproved") or item.get("updatedAt") or item.get("createdAt") or ""), reverse=True)
-    scenery_id = scenery_identifier(scenery[0])
-
-    url = f"{GATEWAY_WEB_BASE}/airports/{icao}/scenery/{scenery_id}/download"
-    try:
-        download_file(url, output_path, timeout=120)
-        return True
-    except Exception as error:
-        log(f"Gateway download failed for {icao}: {error}")
+    scenery_id = gateway_pick_scenery_id(airport)
+    if not scenery_id:
         return False
 
+    text = gateway_scenery_dat(icao, scenery_id)
+    if not text:
+        log(f"Gateway {icao}: no usable layout for scenery {scenery_id}")
+        return False
+    output_path.write_text(text, encoding="utf-8")
+    return True
 
-def gateway_airport_codes() -> list[str]:
+
+def gateway_airport_codes(fallback=()) -> list[str]:
+    """EG airports listed on the Gateway. If the list can't be fetched or
+    parsed, fall back to `fallback` (the airports found in the AIP) rather
+    than silently downloading nothing."""
     for path in ("airports", "airport"):
         try:
             data = gateway_json(path)
-        except Exception:
+        except Exception as error:
+            log(f"Gateway airport list '{path}' failed: {error}")
             continue
-        values = data.get("airports", data) if isinstance(data, dict) else data
+        values = ci_get(data, "airports", default=data) if isinstance(data, dict) else data
         if isinstance(values, list):
             codes = {
-                str(item.get("icao", "")).upper()
+                str(ci_get(item, "icao", "airportCode", "code", default="")).upper()
                 for item in values
-                if isinstance(item, dict) and str(item.get("icao", "")).upper().startswith(REGION)
+                if isinstance(item, dict)
             }
+            codes = {code for code in codes if code.startswith(REGION)}
             if codes:
                 return sorted(codes)
-    return []
+    if fallback:
+        log(f"Gateway airport list unavailable - falling back to {len(fallback)} AIP airports")
+    return sorted(fallback)
 
 
 def locate_eaip_directory(extract_root: Path) -> Path:
@@ -615,7 +1388,7 @@ def locate_eaip_directory(extract_root: Path) -> Path:
         if candidate.is_dir():
             return candidate
 
-    if list(extract_root.rglob("EG-ENR-4.1-en-GB.html")):
+    if find_enr_html(extract_root, "4.1"):
         return extract_root
 
     raise RuntimeError("Could not locate the eAIP HTML directory in the NATS AIRAC ZIP.")
@@ -656,8 +1429,12 @@ def create_release(airac: str, output_dir: Path) -> None:
         airway_count = build_airways_from_html(eaip_root, nav_root, airac)
         aerodrome_count = build_ad_positions(eaip_root, nav_root)
         entry_exit_count = build_ad_entry_exit(eaip_root, nav_root, airac)
+        enr_airspace_count = build_enr_airspace_from_html(eaip_root, bg_root, airac)
+        ad_airspace_count = build_ad_local_airspace_from_html(eaip_root, bg_root, airac)
+        ad_navaid_count = build_ad_navaids_from_html(eaip_root, nav_root, airac)
+        aip_airports = sorted({airport_icao_from_path(p) for p in find_ad2_html_files(eaip_root)})
 
-    codes = gateway_airport_codes()
+    codes = gateway_airport_codes(fallback=aip_airports)
     log(f"Found {len(codes)} EG airport codes on X-Plane Gateway")
     gateway_downloads = 0
     for icao in codes:
@@ -675,6 +1452,9 @@ def create_release(airac: str, output_dir: Path) -> None:
             "airway_segments": airway_count,
             "aerodrome_positions": aerodrome_count,
             "entry_exit_records": entry_exit_count,
+            "enr_airspace_pieces": enr_airspace_count,
+            "ad_local_airspace_pieces": ad_airspace_count,
+            "ad_navaid_records": ad_navaid_count,
             "gateway_layouts": gateway_downloads,
         },
     }
