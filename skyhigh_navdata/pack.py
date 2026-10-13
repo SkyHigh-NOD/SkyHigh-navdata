@@ -14,7 +14,7 @@ SCHEMA_VERSION = 1
 
 # Only these prefixes are ever produced or installed by SkyRadar. Keep in sync
 # with the installer in skyradar/gui/dialogs/airac_update.py.
-ALLOWED_PREFIXES = ("CONFIG/nav/", "CONFIG/ad/")
+ALLOWED_PREFIXES = ("CONFIG/nav/", "CONFIG/ad/", "CONFIG/bg/")
 
 
 def allowed_relative_path(relative: str) -> bool:

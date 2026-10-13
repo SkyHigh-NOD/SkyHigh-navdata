@@ -14,11 +14,15 @@ SkyRadar downloads and installs this ZIP from the repository's latest release.
    - `awy.dat` (ENR 3.2)
    - `AD-positions` (aerodrome reference points, AD 2)
    - `AD-entry-exit` (SID/STAR entry/exit points, AD 2)
-3. Downloads the latest **X-Plane Gateway** airport layout for every aerodrome
+3. Builds the airspace drawings SkyRadar shows in `CONFIG/bg`:
+   - `ENR2-1.lst` + `ENR2-1/*.draw` (FIR/UIR/TMA/CTA, from ENR 2.1)
+   - `<ICAO>.lst` + `<ICAO>/*.draw` (local CTR/ATZ/TMZ, from each airport's
+     AD 2.17)
+4. Downloads the latest **X-Plane Gateway** airport layout for every aerodrome
    into `CONFIG/ad/<ICAO>.dat`.
-4. Writes a `manifest.json` (region, AIRAC cycle, build time, file list with
+5. Writes a `manifest.json` (region, AIRAC cycle, build time, file list with
    sizes and SHA-256 hashes).
-5. Zips it all into `dist/EG_<airac>.zip`.
+6. Zips it all into `dist/EG_<airac>.zip`.
 
 The ZIP mirrors SkyRadar's own folder layout, so it can be extracted straight
 over a SkyRadar installation.
@@ -34,15 +38,17 @@ pip install -r requirements.txt
 ## Usage
 
 ```
-python build_navdata.py                           # full build (nav files + layouts)
-python build_navdata.py --skip-layouts            # nav files only (much faster)
+python build_navdata.py                           # full build (nav + airspace + layouts)
+python build_navdata.py --skip-layouts            # everything except X-Plane layouts
+python build_navdata.py --skip-airspace           # everything except CONFIG/bg drawings
 python build_navdata.py --airac 2610 --source-dir ./html   # offline from extracted eAIP
 python build_navdata.py --airac-zip AIRAC-10-26.zip
 ```
 
 `--airac` accepts `2610` (YYMM), `10/26`, or `202610`. When omitted it is
 detected from NATS. Useful flags: `--out dist`, `--name`, `--work-dir`,
-`--skip-layouts`, `--quiet`. Run `python build_navdata.py -h` for everything.
+`--skip-layouts`, `--skip-airspace`, `--quiet`. Run `python build_navdata.py -h`
+for everything.
 
 ## Publishing a release
 
@@ -67,6 +73,13 @@ EG_2610.zip
     ├── ad
     │   ├── EGLL.dat
     │   └── ...
+    ├── bg
+    │   ├── ENR2-1.lst
+    │   ├── ENR2-1
+    │   │   └── *.draw
+    │   ├── EGLL.lst
+    │   └── EGLL
+    │       └── *.draw
     └── nav
         ├── AD-entry-exit
         ├── AD-positions
@@ -76,5 +89,9 @@ EG_2610.zip
         └── navaid.dat
 ```
 
-SkyRadar refuses to install any file outside `CONFIG/nav/` or `CONFIG/ad/`, and
-verifies each file's SHA-256 against the manifest before writing it.
+SkyRadar refuses to install any file outside `CONFIG/nav/`, `CONFIG/ad/` or
+`CONFIG/bg/`, and verifies each file's SHA-256 against the manifest before
+writing it. Files it installs are recorded in `CONFIG/nav/.airac-status.json` so
+a later release can prune anything that is no longer published; existing files
+that are not part of the release (for example `CONFIG/bg/Notice` or
+`CONFIG/nav/route-presets`) are never touched.

@@ -27,7 +27,7 @@ TAG_RE = re.compile(r"<[^>]+>")
 POINT_TAGS = {"TDESIGNATED_POINT": "11", "TNDB": "2", "TVOR": "3", "TDME": "3"}
 NAV_TYPES = {"VOR": 2, "VORDME": 2, "DME": 3, "NDB": 5, "ILSLOC": 4, "ILSGP": 12, "ILSDME": 3}
 SD_PAIR_RE = re.compile(
-    r'<span class="SD"[^>]*>(?P<val>.*?)</span>\s*<span class="sdParams"[^>]*>(?P<meta>.*?)</span>',
+    r'<span[^>]*class="SD"[^>]*>(?P<val>.*?)</span>\s*<span[^>]*class="sdParams"[^>]*>(?P<meta>.*?)</span>',
     re.DOTALL,
 )
 BAD_NAVPOINTS = {
@@ -323,14 +323,34 @@ def tagged_value(container, field):
     return None
 
 
+# NATS has shipped this filename with both "EG-AD-2.EGSS-..." and
+# "EG-AD-2_EGSS-..." separators (sometimes with a "-2" page suffix) across
+# different AIRAC cycles - accept any of them.
+AD2_FILENAME_RE = re.compile(r"([A-Z0-9]{2})-AD-2[._-]([A-Z0-9]{4})-en-GB(?:-\d+)?\.html", re.I)
+
+
+def airport_icao_from_path(path) -> str | None:
+    match = AD2_FILENAME_RE.fullmatch(Path(path).name)
+    return match.group(2).upper() if match else None
+
+
+def find_ad2_html_files(html_dir, icao_prefix="EG"):
+    """Every AD 2 aerodrome HTML page for the region, sorted by path."""
+    prefix = icao_prefix.upper()
+    found = []
+    for path in sorted(Path(html_dir).rglob("%s-AD-2*-en-GB*.html" % prefix)):
+        match = AD2_FILENAME_RE.fullmatch(path.name)
+        if match and match.group(1).upper() == prefix:
+            found.append(path)
+    return found
+
+
 def parse_ad_positions_html(html_dir, icao_prefix):
     records = []
-    pattern = re.compile(rf"{re.escape(icao_prefix.upper())}-AD-2\.([A-Z0-9]{{4}})-EN-GB\.HTML")
-    for source in sorted(Path(html_dir).rglob(f"{icao_prefix.upper()}-AD-2.*.html")):
-        match = pattern.fullmatch(source.name.upper())
-        if not match:
+    for source in find_ad2_html_files(html_dir, icao_prefix):
+        icao = airport_icao_from_path(source)
+        if not icao:
             continue
-        icao = match.group(1)
         soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
         candidates = []
         arp_heading = soup.find(string=re.compile(r"AERODROME REFERENCE POINT|\bARP\b", re.I))
@@ -388,12 +408,10 @@ def build_ad_entry_exit_from_html(html_dir, nav_dir, icao_prefix, airac_cycle, l
         log("Building AD-entry-exit (SIDs/STARs) from NATS AD 2 HTML...")
     lines = []
     seen = set()
-    pattern = re.compile(rf"{re.escape(icao_prefix.upper())}-AD-2\.([A-Z0-9]{{4}})-EN-GB\.HTML")
-    for source in sorted(Path(html_dir).rglob(f"{icao_prefix.upper()}-AD-2.*.html")):
-        match = pattern.fullmatch(source.name.upper())
-        if not match:
+    for source in find_ad2_html_files(html_dir, icao_prefix):
+        airport = airport_icao_from_path(source)
+        if not airport:
             continue
-        airport = match.group(1)
         soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
         count = 0
         for row in soup.find_all("tr"):

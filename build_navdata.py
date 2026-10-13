@@ -27,6 +27,7 @@ from pathlib import Path
 
 from skyhigh_navdata import GENERATOR_NAME, REGION, __version__
 from skyhigh_navdata import aip, pack
+from skyhigh_navdata.airspace import build_airspace_from_html
 from skyhigh_navdata.build import build_navdata_from_html
 from skyhigh_navdata.cycle import CycleError, normalize
 
@@ -55,6 +56,8 @@ def parse_args(argv=None):
                         help="Use a local NATS AIRAC ZIP instead of downloading it.")
     parser.add_argument("--skip-layouts", action="store_true",
                         help="Skip the X-Plane Gateway airport layouts (CONFIG/ad).")
+    parser.add_argument("--skip-airspace", action="store_true",
+                        help="Skip the ENR 2.1 / AD 2.17 airspace drawings (CONFIG/bg).")
     parser.add_argument("--out", default="dist",
                         help="Output directory for the release ZIP. Default: %(default)s")
     parser.add_argument("--name", default=None,
@@ -130,6 +133,7 @@ def main(argv=None) -> int:
 
     nav_dir = stage_dir / "CONFIG" / "nav"
     ad_dir = stage_dir / "CONFIG" / "ad"
+    bg_dir = stage_dir / "CONFIG" / "bg"
 
     log("%s %s - building navdata for %s" % (GENERATOR_NAME, __version__, region))
     html_dir, cycle_display, cycle_code = resolve_sources(args, stage_dir, log)
@@ -141,6 +145,13 @@ def main(argv=None) -> int:
     icaos = result["icaos"]
 
     sources = {"aip": "NATS UK eAIP (https://nats-uk.ead-it.com)"}
+    if args.skip_airspace:
+        log("Skipping airspace drawings (--skip-airspace).")
+        sources["airspace"] = "skipped"
+    else:
+        log("Building airspace drawings into CONFIG/bg ...")
+        counts.update(build_airspace_from_html(html_dir, bg_dir, region, cycle_display, log=log))
+        sources["airspace"] = "NATS UK eAIP ENR 2.1 / AD 2.17"
     if args.skip_layouts:
         log("Skipping X-Plane Gateway airport layouts (--skip-layouts).")
         sources["layouts"] = "skipped"
