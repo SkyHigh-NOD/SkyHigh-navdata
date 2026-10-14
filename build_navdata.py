@@ -220,6 +220,14 @@ def main(argv=None) -> int:
     out_name = args.name or pack.asset_name(region, cycle_code)
     zip_path = pack.make_zip(stage_dir, out_dir / out_name)
 
+    problems = pack.verify_zip(zip_path, manifest, counts)
+    if problems:
+        raise RuntimeError(
+            "Built ZIP failed its consistency check:\n  - %s\n"
+            "Files the build reported writing are absent from %s (usually a real-time "
+            "antivirus scanner). Add the build folder to your antivirus exclusions, then "
+            "rebuild." % ("\n  - ".join(problems), stage_dir))
+
     if not args.keep_staging:
         shutil.rmtree(stage_dir, ignore_errors=True)
 

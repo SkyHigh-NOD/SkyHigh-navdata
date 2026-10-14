@@ -152,6 +152,55 @@ def make_zip(stage_dir, out_path: Path) -> Path:
     return out_path
 
 
+def verify_zip(zip_path, manifest=None, counts=None):
+    """Re-open a finished ZIP and check it against its manifest.
+
+    Guards against files vanishing from the staging tree while the build runs
+    (an over-eager real-time scanner), which otherwise produces an archive that
+    is quietly short of what the build reported writing. Returns a list of
+    problems; an empty list means the archive is internally consistent.
+    """
+    zip_path = Path(zip_path)
+    problems = []
+    with zipfile.ZipFile(zip_path) as archive:
+        names = set(archive.namelist())
+        if manifest is None:
+            try:
+                manifest = json.loads(archive.read(MANIFEST_NAME).decode("utf-8"))
+            except KeyError:
+                return ["ZIP has no %s" % MANIFEST_NAME]
+            except ValueError as error:
+                return ["%s is not valid JSON: %s" % (MANIFEST_NAME, error)]
+
+        listed = [str(entry.get("path", "")) for entry in manifest.get("files") or []]
+        expected = set(listed)
+        actual = names - {MANIFEST_NAME}
+        if len(listed) != len(expected):
+            problems.append("the manifest lists a path more than once")
+        missing = sorted(expected - actual)
+        if missing:
+            problems.append("%d manifest file(s) missing from the ZIP, e.g. %s"
+                            % (len(missing), ", ".join(missing[:3])))
+        extra = sorted(actual - expected)
+        if extra:
+            problems.append("%d ZIP file(s) absent from the manifest, e.g. %s"
+                            % (len(extra), ", ".join(extra[:3])))
+
+        counts = counts if counts is not None else (manifest.get("counts") or {})
+        if counts:
+            ad = sum(1 for name in actual if name.startswith("CONFIG/ad/"))
+            want_ad = (counts.get("layouts") or 0) + (counts.get("layouts_custom") or 0)
+            if want_ad and ad < want_ad:
+                problems.append("%d CONFIG/ad layout(s) present, build counted %d"
+                                % (ad, want_ad))
+            draw = sum(1 for name in actual if name.endswith(".draw"))
+            want_draw = (counts.get("enr_airspace") or 0) + (counts.get("ad_airspace") or 0)
+            if want_draw and draw < want_draw:
+                problems.append("%d .draw drawing(s) present, build counted %d"
+                                % (draw, want_draw))
+    return problems
+
+
 def asset_name(region: str, airac_code: str) -> str:
     """Release asset name, e.g. ``EG_2610.zip`` (FIR + AIRAC code).
 
