@@ -14,6 +14,8 @@ SkyRadar downloads and installs this ZIP from the repository's latest release.
    - `awy.dat` (ENR 3.2)
    - `AD-positions` (aerodrome reference points, AD 2)
    - `AD-entry-exit` (SID/STAR entry/exit points, AD 2)
+   - `CTR-positions` (default enroute radar position for the launcher's CTR
+     dropdown, so a fresh install has `ENR21` to start from)
 3. Builds the airspace drawings SkyRadar shows in `CONFIG/bg`:
    - `ENR21.lst` + `ENR21/*.draw` (FIR/UIR/TMA/CTA, from ENR 2.1). The
      volumes are grouped by named area, so each `.draw` is one togglable
@@ -119,6 +121,7 @@ EG_2610.zip
     └── nav
         ├── AD-entry-exit
         ├── AD-positions
+        ├── CTR-positions
         ├── airac.txt
         ├── awy.dat
         ├── fix.dat

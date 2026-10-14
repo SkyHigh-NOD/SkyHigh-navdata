@@ -220,6 +220,7 @@ _COUNT_LABELS = {
     "entry_exit_points": "SID/STAR entry-exit points",
     "enr_airspace": "ENR 2.1 sector drawings",
     "ad_airspace": "Local airspace drawings",
+    "ctr_positions": "Default CTR positions",
     "layouts": "X-Plane Gateway layouts",
     "layouts_custom": "Local layout overrides",
     "layouts_unavailable": "Layouts unavailable",
@@ -274,8 +275,8 @@ def render_release_notes(manifest) -> str:
     lines += [
         "## Contents",
         "",
-        "- `CONFIG/nav/` - navaids, fixes, airways, aerodrome positions and "
-        "SID/STAR entry-exit points",
+        "- `CONFIG/nav/` - navaids, fixes, airways, aerodrome positions, "
+        "SID/STAR entry-exit points and default enroute positions",
         "- `CONFIG/ad/<ICAO>.dat` - airport layouts",
         "- `CONFIG/bg/` - airspace drawings (`ENR21.lst`, per-aerodrome `.lst` "
         "and `.draw`)",

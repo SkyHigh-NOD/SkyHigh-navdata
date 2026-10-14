@@ -462,6 +462,39 @@ def build_ad_entry_exit_from_html(html_dir, nav_dir, icao_prefix, airac_cycle, l
     return len(lines)
 
 
+# --- Default CTR (enroute) radar positions ----------------------------------
+
+# SkyRadar's launcher lists the CTR positions the controller has saved locally
+# (CONFIG/CTR-positions.conf) and starts from these shipped defaults for any
+# code there is no local entry for - so a fresh install already has an enroute
+# position to pick. The name matches the ENR 2.1 sector group the airspace
+# builder writes (CONFIG/bg/ENR21*), i.e. the whole UK enroute is one position
+# whose sectors are then ticked on the radar.
+DEFAULT_CTR_POSITIONS = [
+    ("ENR21", "52.5,-1.5", "UK enroute (ENR 2.1 sectors)"),
+]
+
+def build_ctr_positions(nav_dir, airac_cycle="", log=None):
+    """Write the default CTR radar positions shipped with the navdata."""
+    output = Path(nav_dir) / "CTR-positions"
+    lines = [
+        "# Default CTR (enroute) radar positions, cycle %s, build %s." % (
+            airac_cycle,
+            datetime.now().strftime("%Y%m%d"),
+        ),
+        "# Format: <location code><TAB><radar position point spec>",
+        "# SkyRadar uses these for any code without a locally saved entry; a",
+        "# position saved locally under the same name always takes precedence.",
+    ]
+    for code, spec, description in DEFAULT_CTR_POSITIONS:
+        lines.append("# %s" % description)
+        lines.append("%s\t%s" % (code, spec))
+    _atomic_write_text(output, "\n".join(lines) + "\n")
+    if log:
+        log("Wrote %d default CTR position(s) to %s" % (len(DEFAULT_CTR_POSITIONS), output))
+    return len(DEFAULT_CTR_POSITIONS)
+
+
 # --- Orchestration ----------------------------------------------------------
 
 def build_navdata_from_html(html_dir, nav_dir, icao_prefix="EG", airac_cycle="", log=None):
@@ -475,6 +508,7 @@ def build_navdata_from_html(html_dir, nav_dir, icao_prefix="EG", airac_cycle="",
     airways = build_airways_from_html(html_dir, nav_dir, icao_prefix, airac_cycle, log)
     icaos = build_ad_positions_from_html(html_dir, nav_dir, icao_prefix, airac_cycle, log)
     entry_exit = build_ad_entry_exit_from_html(html_dir, nav_dir, icao_prefix, airac_cycle, log)
+    ctr_positions = build_ctr_positions(nav_dir, airac_cycle, log)
     return {
         "counts": {
             "navaids": navaids,
@@ -482,6 +516,7 @@ def build_navdata_from_html(html_dir, nav_dir, icao_prefix="EG", airac_cycle="",
             "airway_segments": airways,
             "aerodromes": len(icaos),
             "entry_exit_points": entry_exit,
+            "ctr_positions": ctr_positions,
         },
         "icaos": icaos,
     }
