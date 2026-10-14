@@ -218,7 +218,7 @@ _COUNT_LABELS = {
     "fixes": "Fixes",
     "airway_segments": "Airway segments",
     "entry_exit_points": "SID/STAR entry-exit points",
-    "enr_airspace": "ENR 2.1 airspace drawings",
+    "enr_airspace": "ENR 2.1 sector drawings",
     "ad_airspace": "Local airspace drawings",
     "layouts": "X-Plane Gateway layouts",
     "layouts_custom": "Local layout overrides",
