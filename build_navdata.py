@@ -33,6 +33,11 @@ from skyhigh_navdata.cycle import CycleError, normalize
 
 SUPPORTED_REGIONS = (REGION,)
 
+# Hand-maintained files kept in the repository's CONFIG/ folder override
+# anything the build generates (customised sector airspace, airport layouts,
+# navaids, ...), and are shipped in the release exactly as written.
+DEFAULT_OVERRIDES_DIR = Path(__file__).resolve().parent / "CONFIG"
+
 
 def make_logger(quiet: bool = False):
     def log(message: str) -> None:
@@ -58,6 +63,11 @@ def parse_args(argv=None):
                         help="Skip the X-Plane Gateway airport layouts (CONFIG/ad).")
     parser.add_argument("--skip-airspace", action="store_true",
                         help="Skip the ENR 2.1 / AD 2.17 airspace drawings (CONFIG/bg).")
+    parser.add_argument("--overrides-dir", default=None,
+                        help="CONFIG folder of hand-maintained files that override generated "
+                             "ones. Default: the repository's CONFIG/ folder.")
+    parser.add_argument("--no-overrides", action="store_true",
+                        help="Ignore the local CONFIG/ overrides.")
     parser.add_argument("--out", default="dist",
                         help="Output directory for the release ZIP. Default: %(default)s")
     parser.add_argument("--name", default=None,
@@ -131,6 +141,15 @@ def main(argv=None) -> int:
         shutil.rmtree(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.no_overrides:
+        overrides_dir = None
+    elif args.overrides_dir:
+        overrides_dir = Path(args.overrides_dir)
+        if not overrides_dir.is_dir():
+            raise SystemExit("--overrides-dir is not a directory: %s" % overrides_dir)
+    else:
+        overrides_dir = DEFAULT_OVERRIDES_DIR if DEFAULT_OVERRIDES_DIR.is_dir() else None
+
     nav_dir = stage_dir / "CONFIG" / "nav"
     ad_dir = stage_dir / "CONFIG" / "ad"
     bg_dir = stage_dir / "CONFIG" / "bg"
@@ -156,12 +175,25 @@ def main(argv=None) -> int:
         log("Skipping X-Plane Gateway airport layouts (--skip-layouts).")
         sources["layouts"] = "skipped"
     else:
+        custom_icaos = pack.custom_ad_icaos(overrides_dir)
+        if custom_icaos:
+            log("Using local CONFIG/ad overrides for: %s" % ", ".join(sorted(custom_icaos)))
         log("Downloading %d airport layouts from the X-Plane Gateway ..." % len(icaos))
-        layout_summary = aip.download_all_ad_layouts(icaos, ad_dir, log=log)
+        layout_summary = aip.download_all_ad_layouts(icaos, ad_dir, log=log, skip=custom_icaos)
         counts["layouts"] = layout_summary["downloaded"]
+        counts["layouts_custom"] = layout_summary["custom"]
         counts["layouts_unavailable"] = layout_summary["unavailable"]
         counts["layouts_failed"] = layout_summary["failed"]
-        sources["layouts"] = "X-Plane Gateway (https://gateway.x-plane.com)"
+        sources["layouts"] = "X-Plane Gateway (https://gateway.x-plane.com) with local overrides"
+
+    if overrides_dir:
+        log("Applying local overrides from %s ..." % overrides_dir)
+        applied = pack.apply_overrides(stage_dir, overrides_dir, log=log)
+        counts["overrides"] = len(applied)
+        sources["overrides"] = ("%d file(s) from %s" % (len(applied), overrides_dir)
+                                if applied else "none")
+    else:
+        sources["overrides"] = "none"
 
     (nav_dir / "airac.txt").write_text(
         "region: %s\nairac: %s\nairac_code: %s\nbuilt_utc: %s\ngenerator: %s %s\n" % (

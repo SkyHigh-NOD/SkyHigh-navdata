@@ -20,9 +20,11 @@ SkyRadar downloads and installs this ZIP from the repository's latest release.
      AD 2.17)
 4. Downloads the latest **X-Plane Gateway** airport layout for every aerodrome
    into `CONFIG/ad/<ICAO>.dat`.
-5. Writes a `manifest.json` (region, AIRAC cycle, build time, file list with
+5. Copies the hand-maintained **`CONFIG/` overrides** (see below) over the
+   generated files, so local customisations always win.
+6. Writes a `manifest.json` (region, AIRAC cycle, build time, file list with
    sizes and SHA-256 hashes).
-6. Zips it all into `dist/EG_<airac>.zip`.
+7. Zips it all into `dist/EG_<airac>.zip`.
 
 The ZIP mirrors SkyRadar's own folder layout, so it can be extracted straight
 over a SkyRadar installation.
@@ -47,8 +49,33 @@ python build_navdata.py --airac-zip AIRAC-10-26.zip
 
 `--airac` accepts `2610` (YYMM), `10/26`, or `202610`. When omitted it is
 detected from NATS. Useful flags: `--out dist`, `--name`, `--work-dir`,
-`--skip-layouts`, `--skip-airspace`, `--quiet`. Run `python build_navdata.py -h`
-for everything.
+`--skip-layouts`, `--skip-airspace`, `--overrides-dir`, `--no-overrides`,
+`--quiet`. Run `python build_navdata.py -h` for everything.
+
+## Customised files (local overrides)
+
+Anything kept in this repository's `CONFIG/` folder is copied over the generated
+output, so hand-edited sector and layout files always win and are shipped in the
+release exactly as written:
+
+```
+CONFIG/
+└── ad
+    └── EGSS.dat      # hand-made Stansted layout; replaces the Gateway one
+```
+
+- The folder mirrors the ZIP, so `CONFIG/ad/EGSS.dat` replaces the Gateway-built
+  `CONFIG/ad/EGSS.dat`, `CONFIG/bg/EGLL.lst` replaces a generated airspace list,
+  `CONFIG/nav/navaid.dat` replaces the NATS-derived navaids, and so on.
+- A custom `CONFIG/ad/<ICAO>.dat` also **skips** the X-Plane Gateway download for
+  that aerodrome, so the build is faster and works offline for those.
+- Only `CONFIG/nav/`, `CONFIG/ad/` and `CONFIG/bg/` are ever shipped; anything
+  else under `CONFIG/` is ignored. `airac.txt` and `manifest.json` are always
+  generated and are never overridden.
+- Editing a file here and re-running the build is all that is needed — the
+  override is picked up automatically.
+- Disable with `--no-overrides`, or read them from elsewhere with
+  `--overrides-dir DIR`. The build summary reports `overrides=N`.
 
 ## Publishing a release
 

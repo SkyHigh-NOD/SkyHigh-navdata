@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,69 @@ def _iter_stage_files(stage_dir: Path):
     for path in sorted(Path(stage_dir).rglob("*")):
         if path.is_file() and path.name != MANIFEST_NAME:
             yield path
+
+
+# --- Local overrides --------------------------------------------------------
+
+# Files that are never shipped even if they turn up in the overrides folder.
+_OVERRIDE_SKIP_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
+def custom_ad_icaos(overrides_dir):
+    """ICAOs with a hand-maintained ``CONFIG/ad/<ICAO>.dat`` override.
+
+    Used to skip the X-Plane Gateway download for those aerodromes.
+    """
+    if not overrides_dir:
+        return set()
+    ad_dir = Path(overrides_dir) / "ad"
+    if not ad_dir.is_dir():
+        return set()
+    return {path.stem.upper() for path in ad_dir.glob("*.dat") if path.is_file()}
+
+
+def iter_overrides(overrides_dir):
+    """Yield ``(installable relative path, source Path)`` for each override file.
+
+    ``overrides_dir`` is a ``CONFIG`` folder; its contents map onto the ZIP's
+    ``CONFIG/`` tree, e.g. ``<overrides_dir>/ad/EGSS.dat`` -> ``CONFIG/ad/EGSS.dat``.
+    """
+    if not overrides_dir:
+        return
+    overrides_dir = Path(overrides_dir)
+    if not overrides_dir.is_dir():
+        return
+    for path in sorted(overrides_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        parts = path.relative_to(overrides_dir).parts
+        if any(part.startswith(".") or part == "__pycache__" for part in parts):
+            continue
+        if path.name in _OVERRIDE_SKIP_NAMES:
+            continue
+        yield "CONFIG/" + "/".join(parts), path
+
+
+def apply_overrides(stage_dir, overrides_dir, log=None) -> list:
+    """Copy hand-maintained files over the generated staging tree.
+
+    Returns the relative paths written, in the ZIP's ``CONFIG/...`` form.
+    Anything outside the installable prefixes is ignored.
+    """
+    stage_dir = Path(stage_dir)
+    applied = []
+    for relative, source in iter_overrides(overrides_dir):
+        if not allowed_relative_path(relative):
+            if log:
+                log("Ignoring override %s (not an installable path)." % relative)
+            continue
+        target = stage_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+        applied.append(relative)
+        if log:
+            log("Override: %s (from %s)" % (relative, source))
+    return applied
 
 
 def build_manifest(stage_dir, *, region: str = REGION, airac: str = "", airac_code: str = "",

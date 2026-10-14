@@ -176,13 +176,23 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
     return True
 
 
-def download_all_ad_layouts(icaos, ad_dir, log=None) -> dict:
-    """Download one apt.dat per aerodrome into ``ad_dir``. Returns a counts summary."""
+def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None) -> dict:
+    """Download one apt.dat per aerodrome into ``ad_dir``. Returns a counts summary.
+
+    ``skip`` is an optional collection of ICAOs that already have a local
+    override; those are left for the caller to supply instead of downloading.
+    """
     ad_dir = Path(ad_dir)
     ad_dir.mkdir(parents=True, exist_ok=True)
-    downloaded = unavailable = failed = 0
+    skip = {code.upper() for code in skip} if skip else set()
+    downloaded = unavailable = failed = custom = 0
     layouts = []
     for index, icao in enumerate(icaos, start=1):
+        if icao.upper() in skip:
+            custom += 1
+            if log:
+                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, len(icaos), icao))
+            continue
         output = ad_dir / (icao.upper() + ".dat")
         if log:
             log("[%d/%d] X-Plane Gateway layout: %s" % (index, len(icaos), icao))
@@ -198,7 +208,7 @@ def download_all_ad_layouts(icaos, ad_dir, log=None) -> dict:
                 log("Failed to download %s layout: %s" % (icao, error))
         time.sleep(0.25)
     if log:
-        log("Airport layouts complete: %d downloaded, %d unavailable, %d failed."
-            % (downloaded, unavailable, failed))
-    return {"downloaded": downloaded, "unavailable": unavailable,
+        log("Airport layouts complete: %d downloaded, %d overridden, %d unavailable, %d failed."
+            % (downloaded, custom, unavailable, failed))
+    return {"downloaded": downloaded, "custom": custom, "unavailable": unavailable,
             "failed": failed, "layouts": layouts}
