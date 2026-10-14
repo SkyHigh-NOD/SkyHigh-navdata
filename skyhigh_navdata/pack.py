@@ -102,7 +102,8 @@ def apply_overrides(stage_dir, overrides_dir, log=None) -> list:
 
 
 def build_manifest(stage_dir, *, region: str = REGION, airac: str = "", airac_code: str = "",
-                   sources=None, counts=None, generator=GENERATOR_NAME, generator_version="") -> dict:
+                   sources=None, counts=None, generator=GENERATOR_NAME, generator_version="",
+                   overrides=None) -> dict:
     stage_dir = Path(stage_dir)
     files = []
     for path in _iter_stage_files(stage_dir):
@@ -121,6 +122,7 @@ def build_manifest(stage_dir, *, region: str = REGION, airac: str = "", airac_co
         "built_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "sources": sources or {},
         "counts": counts or {},
+        "overrides": list(overrides or []),
         "files": files,
     }
     return manifest
@@ -157,3 +159,106 @@ def asset_name(region: str, airac_code: str) -> str:
     the repository's latest release rather than a fixed URL.
     """
     return "%s_%s.zip" % (region.upper(), airac_code)
+
+
+# --- Release notes ----------------------------------------------------------
+
+_COUNT_LABELS = {
+    "aerodromes": "Aerodromes",
+    "navaids": "Navaids",
+    "fixes": "Fixes",
+    "airway_segments": "Airway segments",
+    "entry_exit_points": "SID/STAR entry-exit points",
+    "enr_airspace": "ENR 2.1 airspace drawings",
+    "ad_airspace": "Local airspace drawings",
+    "layouts": "X-Plane Gateway layouts",
+    "layouts_custom": "Local layout overrides",
+    "layouts_unavailable": "Layouts unavailable",
+    "layouts_failed": "Layouts failed",
+    "overrides": "Local CONFIG overrides",
+}
+
+
+def _count_label(key: str) -> str:
+    return _COUNT_LABELS.get(key, key.replace("_", " ").capitalize())
+
+
+def render_release_notes(manifest) -> str:
+    """Markdown release notes for a build, ready to paste into a GitHub release."""
+    region = str(manifest.get("region") or REGION)
+    airac = str(manifest.get("airac") or "")
+    code = str(manifest.get("airac_code") or "")
+    asset = asset_name(region, code)
+    files = manifest.get("files") or []
+    counts = manifest.get("counts") or {}
+    sources = manifest.get("sources") or {}
+    overrides = manifest.get("overrides") or []
+
+    lines = [
+        "# AIRAC %s - %s navdata" % (airac or code, region),
+        "",
+        "SkyRadar navigation data for the **%s** FIR/UIR." % region,
+        "",
+        "Install with SkyRadar's launcher -> **AIRAC update**, or download `%s` and "
+        "extract it over the SkyRadar folder." % asset,
+        "",
+        "## Asset",
+        "",
+        "| | |",
+        "|---|---|",
+        "| File | `%s` |" % asset,
+        "| AIRAC cycle | %s (`%s`) |" % (airac, code),
+        "| Region | %s |" % region,
+        "| Files | %d |" % len(files),
+        "| Built | %s |" % manifest.get("built_utc", ""),
+        "| Generator | %s %s |" % (manifest.get("generator", GENERATOR_NAME),
+                                   manifest.get("generator_version", "")),
+        "",
+    ]
+
+    if counts:
+        lines += ["## Counts", "", "| Metric | Value |", "|---|---|"]
+        for key in sorted(counts):
+            lines.append("| %s | %s |" % (_count_label(key), counts[key]))
+        lines.append("")
+
+    lines += [
+        "## Contents",
+        "",
+        "- `CONFIG/nav/` - navaids, fixes, airways, aerodrome positions and "
+        "SID/STAR entry-exit points",
+        "- `CONFIG/ad/<ICAO>.dat` - airport layouts",
+        "- `CONFIG/bg/` - airspace drawings (`ENR2-1.lst`, per-aerodrome `.lst` "
+        "and `.draw`)",
+        "- `manifest.json` - SHA-256 and size for every file above",
+        "",
+    ]
+
+    if overrides:
+        lines += ["## Local overrides", "",
+                  "Taken from the repository's `CONFIG/` folder; these replace the "
+                  "generated versions:", ""]
+        lines += ["- `%s`" % path for path in overrides]
+        lines.append("")
+
+    if sources:
+        lines += ["## Sources", ""]
+        for key in sorted(sources):
+            lines.append("- **%s:** %s" % (key, sources[key]))
+        lines.append("")
+
+    lines += [
+        "SkyRadar installs only `CONFIG/nav/`, `CONFIG/ad/` and `CONFIG/bg/`, verifies "
+        "each file's SHA-256 and size, prunes files from the previous cycle, and never "
+        "touches `route-presets` or `CONFIG/bg/Notice`.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_release_notes(path, manifest) -> Path:
+    """Write the markdown release notes for ``manifest`` to ``path``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_release_notes(manifest), encoding="utf-8")
+    return path

@@ -25,6 +25,8 @@ SkyRadar downloads and installs this ZIP from the repository's latest release.
 6. Writes a `manifest.json` (region, AIRAC cycle, build time, file list with
    sizes and SHA-256 hashes).
 7. Zips it all into `dist/EG_<airac>.zip`.
+8. Writes matching **release notes** next to it, `dist/EG_<airac>.md`, ready to
+   paste into the GitHub release.
 
 The ZIP mirrors SkyRadar's own folder layout, so it can be extracted straight
 over a SkyRadar installation.
@@ -50,7 +52,8 @@ python build_navdata.py --airac-zip AIRAC-10-26.zip
 `--airac` accepts `2610` (YYMM), `10/26`, or `202610`. When omitted it is
 detected from NATS. Useful flags: `--out dist`, `--name`, `--work-dir`,
 `--skip-layouts`, `--skip-airspace`, `--overrides-dir`, `--no-overrides`,
-`--quiet`. Run `python build_navdata.py -h` for everything.
+`--notes-out`, `--no-notes`, `--quiet`. Run `python build_navdata.py -h` for
+everything.
 
 ## Customised files (local overrides)
 
@@ -81,9 +84,11 @@ CONFIG/
 
 For each new AIRAC cycle:
 
-1. Run `python build_navdata.py` → `dist/EG_2610.zip` (cycle 10/26).
+1. Run `python build_navdata.py` → `dist/EG_2610.zip` (cycle 10/26) plus
+   `dist/EG_2610.md` (the release notes).
 2. Create a GitHub release; tag it with the cycle, e.g. `airac-2610`.
-3. Upload the ZIP as a release asset.
+3. Upload the ZIP as a release asset and paste `dist/EG_2610.md` into the
+   release description.
 
 The asset name **includes the cycle** (`EG_2610.zip`), so the name changes every
 cycle — that is intentional. SkyRadar does not use a fixed URL: it queries

@@ -68,6 +68,11 @@ def parse_args(argv=None):
                              "ones. Default: the repository's CONFIG/ folder.")
     parser.add_argument("--no-overrides", action="store_true",
                         help="Ignore the local CONFIG/ overrides.")
+    parser.add_argument("--notes-out", default=None,
+                        help="Where to write the release notes. Default: beside the ZIP, "
+                             "as <zip>.md")
+    parser.add_argument("--no-notes", action="store_true",
+                        help="Do not write the release notes file.")
     parser.add_argument("--out", default="dist",
                         help="Output directory for the release ZIP. Default: %(default)s")
     parser.add_argument("--name", default=None,
@@ -186,6 +191,7 @@ def main(argv=None) -> int:
         counts["layouts_failed"] = layout_summary["failed"]
         sources["layouts"] = "X-Plane Gateway (https://gateway.x-plane.com) with local overrides"
 
+    applied = []
     if overrides_dir:
         log("Applying local overrides from %s ..." % overrides_dir)
         applied = pack.apply_overrides(stage_dir, overrides_dir, log=log)
@@ -206,7 +212,7 @@ def main(argv=None) -> int:
 
     manifest = pack.build_manifest(
         stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
-        sources=sources, counts=counts,
+        sources=sources, counts=counts, overrides=applied,
         generator=GENERATOR_NAME, generator_version=__version__,
     )
     pack.write_manifest(stage_dir, manifest)
@@ -217,12 +223,19 @@ def main(argv=None) -> int:
     if not args.keep_staging:
         shutil.rmtree(stage_dir, ignore_errors=True)
 
+    notes_path = None
+    if not args.no_notes:
+        notes_path = Path(args.notes_out) if args.notes_out else zip_path.with_suffix(".md")
+        pack.write_release_notes(notes_path, manifest)
+
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print("", flush=True)
     print("Built %s" % zip_path, flush=True)
     print("  AIRAC cycle : %s (%s)" % (cycle_display, cycle_code), flush=True)
     print("  Files       : %d (%.2f MB)" % (len(manifest["files"]), size_mb), flush=True)
     print("  Counts      : %s" % ", ".join("%s=%s" % item for item in sorted(counts.items())), flush=True)
+    if notes_path:
+        print("  Notes       : %s" % notes_path, flush=True)
     print("", flush=True)
     print("Next: upload this ZIP as an asset of a GitHub release (e.g. tag 'airac-%s')." % cycle_code, flush=True)
     print("SkyRadar installs the newest asset from the repo's latest release.", flush=True)
