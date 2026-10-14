@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +24,15 @@ from .build import (
     airport_icao_from_path,
     clean,
     dms_to_decimal,
+    extract_entities,
     find_ad2_html_files,
 )
 
 AIRSPACE_COLOUR = "turquoise"
+# ENR 2.1 is one group: its volumes are drawn as togglable "sectors" on the
+# radar, so the group name is also a valid SkyRadar launcher location code
+# (letters/digits only - a hyphen, as in "ENR2-1", would be rejected).
+GROUP_NAME = "ENR21"
 EARTH_RADIUS_NM = 3440.065
 # arcs (and full circles, e.g. an ATZ) get flattened to a polyline; one
 # vertex per this many degrees of sweep
@@ -220,6 +226,41 @@ def airspace_pretty(words) -> str:
     return " ".join(out)
 
 
+# trailing tokens dropped when collapsing an AIP entry into a family: an
+# ordinal, a compass/direction word or a parenthetical, e.g.
+# "CHANNEL ISLANDS CTA 1 NORTH" and "LONDON TMA 7" -> "... CTA" / "LONDON TMA"
+_FAMILY_TAIL_RE = re.compile(
+    r"(?:\s*\([^)]*\)|\s+\d+|\s+(?:NORTH|SOUTH|EAST|WEST|NORTHERN|SOUTHERN|"
+    r"EASTERN|WESTERN|CENTRAL))$"
+)
+
+
+def airspace_family(name: str) -> str:
+    """Group key for an ENR 2.1 entry: its name with a trailing ordinal,
+    compass word or parenthetical stripped, so the several volumes that make
+    up one named area draw as a single togglable sector on the radar."""
+    key = re.sub(r"\s+", " ", name).strip().upper()
+    while True:
+        trimmed = _FAMILY_TAIL_RE.sub("", key).strip()
+        if not trimmed or trimmed == key:
+            break
+        key = trimmed
+    return key
+
+
+def _row_field(entities, tag, field):
+    """Values for every entity of the given table/field in one parsed row."""
+    values = []
+    for (entity_tag, _), fields in entities.items():
+        if entity_tag == tag:
+            values.extend(fields.get(field, []))
+    return values
+
+
+def _most_common(values):
+    return Counter(values).most_common(1)[0][0] if values else ""
+
+
 def write_draw_file(path: Path, header_lines, points):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\r\n") as file:
@@ -230,10 +271,43 @@ def write_draw_file(path: Path, header_lines, points):
             file.write(f"{lat:.7f},{lon:.7f}\n")
 
 
+def write_draw_sections(path: Path, sections):
+    """Several drawing blocks in one file, each its own colour line followed
+    by its points and separated by a blank line (see CONFIG/bg/Notice). Lets a
+    whole family of volumes live in one togglable .draw file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        for number, (header_lines, points) in enumerate(sections):
+            if number > 0:
+                file.write("\n")
+            for line in header_lines:
+                file.write(f"# {line}\n")
+            file.write(f"{AIRSPACE_COLOUR}\n")
+            for lat, lon in points:
+                file.write(f"{lat:.7f},{lon:.7f}\n")
+
+
 def write_lst_file(path: Path, entries):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\r\n") as file:
         file.write("\n".join(entries))
+
+
+def write_sectors_file(path: Path, rows, airac_cycle=""):
+    """The sector table SkyRadar reads to map a ticked drawing to its owning
+    unit, callsign and frequencies. Tab-separated with '#' comments so it can
+    be hand-edited, and kept apart from the .lst so a real sector file's data
+    could replace it later without touching the drawings."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\r\n") as file:
+        file.write("# SkyRadar enroute sector table, generated from UK eAIP ENR 2.1\n")
+        file.write("# Data cycle %s, build %s\n" % (airac_cycle, _build_date()))
+        file.write("# id\t draw\t name\t unit\t callsign\t frequencies\n")
+        for row in rows:
+            file.write("\t".join([
+                row["id"], row["draw"], row["name"], row["unit"],
+                row["callsign"], ",".join(row["freqs"]),
+            ]) + "\n")
 
 
 # --- ENR 2.1: FIR / UIR / TMA / CTA -----------------------------------------
@@ -270,8 +344,10 @@ def build_enr_airspace_from_html(html_dir, bg_dir, airac_cycle="", log=None):
     soup = BeautifulSoup(source.read_text(encoding="utf-8", errors="replace"), "lxml")
 
     output_bg = Path(bg_dir)
-    group_dir = output_bg / "ENR2-1"
-    index, used, skipped, total_points = [], {}, 0, 0
+    group_dir = output_bg / GROUP_NAME
+    skipped = 0
+    volumes = []  # every airspace volume, in AIP order
+    current = None
 
     for table in soup.find_all("table"):
         for tbody in table.find_all("tbody", recursive=False):
@@ -279,49 +355,92 @@ def build_enr_airspace_from_html(html_dir, bg_dir, airac_cycle="", log=None):
                 cell = row.find("td")
                 if cell is None:
                     continue
+                entities = extract_entities(row)
 
-                name = None
-                for match in SD_PAIR_RE.finditer(str(cell)):
-                    parts = clean(match.group("meta")).split(";")
-                    if len(parts) == 3 and parts[0] == "TAIRSPACE" and parts[1] == "TXT_NAME":
-                        name = clean(match.group("val"))
-                        break
-                if not name:
-                    continue
+                names = _row_field(entities, "TAIRSPACE", "TXT_NAME")
+                if names:
+                    name = names[0]
+                    lateral = next((p for p in cell.find_all("p")
+                                    if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p)), None)
+                    current = {
+                        "name": name,
+                        "lateral": lateral,
+                        "header": [name, *enr_airspace_limits(cell)],
+                        "unit": (_row_field(entities, "TUNIT", "TXT_NAME") or [""])[0],
+                        "callsign": (_row_field(entities, "TCALLSIGN_DETAIL", "TXT_CALL_SIGN") or [""])[0],
+                        "freqs": list(_row_field(entities, "TFREQUENCY", "VAL_FREQ_TRANS")),
+                    }
+                    volumes.append(current)
+                elif current is not None:
+                    # continuation row: the callsign cell rowspans the volume, so
+                    # the extra frequencies (and any unit/callsign) live here
+                    if not current["unit"]:
+                        current["unit"] = (_row_field(entities, "TUNIT", "TXT_NAME") or [""])[0]
+                    if not current["callsign"]:
+                        current["callsign"] = (_row_field(entities, "TCALLSIGN_DETAIL",
+                                                          "TXT_CALL_SIGN") or [""])[0]
+                    for freq in _row_field(entities, "TFREQUENCY", "VAL_FREQ_TRANS"):
+                        if freq not in current["freqs"]:
+                            current["freqs"].append(freq)
 
-                lateral = next((p for p in cell.find_all("p")
-                                if "TAIRSPACE_VERTEX;GEO_LAT;" in str(p)), None)
-                if lateral is None:
-                    _log(log, "WARNING: %s has no lateral limits, skipping" % name)
-                    skipped += 1
-                    continue
+    families, order = {}, []
+    for volume in volumes:
+        if volume["lateral"] is None:
+            _log(log, "WARNING: %s has no lateral limits, skipping" % volume["name"])
+            skipped += 1
+            continue
+        points = boundary(volume["lateral"], volume["name"], log)
+        if len(points) < 3:
+            _log(log, "WARNING: %s resolved to %d point(s), skipping"
+                 % (volume["name"], len(points)))
+            skipped += 1
+            continue
+        volume["points"] = points
+        key = airspace_family(volume["name"])
+        if key not in families:
+            families[key] = []
+            order.append(key)
+        families[key].append(volume)
 
-                points = boundary(lateral, name, log)
-                if len(points) < 3:
-                    _log(log, "WARNING: %s resolved to %d point(s), skipping" % (name, len(points)))
-                    skipped += 1
-                    continue
-
-                stem = airspace_slug(name)
-                used[stem] = used.get(stem, 0) + 1
-                if used[stem] > 1:
-                    stem = f"{stem}-{used[stem]}"
-                filename = f"{stem}.draw"
-
-                header = [name, *enr_airspace_limits(cell)]
-                header.append("Data cycle %s, build %s, generated from UK eAIP ENR 2.1"
-                              % (airac_cycle, _build_date()))
-
-                write_draw_file(group_dir / filename, header, points)
-                total_points += len(points)
-                index.append(f"ENR2-1/{filename}  DRAW  {airspace_pretty(name.split())}")
-
-    if not index:
+    if not order:
         raise RuntimeError("No airspace extracted from ENR 2.1.")
 
-    write_lst_file(output_bg / "ENR2-1.lst", index)
-    _log(log, "Wrote %d ENR 2.1 airspace file(s) (%d points), skipped %d"
-         % (len(index), total_points, skipped))
+    used, index, sector_rows, total_points = {}, [], [], 0
+    for key in order:
+        members = families[key]
+        stem = airspace_slug(key)
+        used[stem] = used.get(stem, 0) + 1
+        if used[stem] > 1:
+            stem = f"{stem}-{used[stem]}"
+        filename = f"{stem}.draw"
+
+        sections = [(volume["header"], volume["points"]) for volume in members]
+        sections[-1][0].append("Data cycle %s, build %s, generated from UK eAIP ENR 2.1"
+                               % (airac_cycle, _build_date()))
+        write_draw_sections(group_dir / filename, sections)
+
+        total_points += sum(len(volume["points"]) for volume in members)
+        friendly = airspace_pretty(key.split())
+        index.append(f"{GROUP_NAME}/{filename}  DRAW  {friendly}")
+
+        freqs = []
+        for volume in members:
+            for freq in volume["freqs"]:
+                if freq not in freqs:
+                    freqs.append(freq)
+        sector_rows.append({
+            "id": stem,
+            "draw": f"{GROUP_NAME}/{filename}",
+            "name": friendly,
+            "unit": _most_common([v["unit"] for v in members if v["unit"]]),
+            "callsign": _most_common([v["callsign"] for v in members if v["callsign"]]),
+            "freqs": freqs,
+        })
+
+    write_lst_file(output_bg / f"{GROUP_NAME}.lst", index)
+    write_sectors_file(output_bg / f"{GROUP_NAME}.sectors", sector_rows, airac_cycle)
+    _log(log, "Wrote %d ENR 2.1 sector group(s) from %d volume(s) (%d points), skipped %d"
+         % (len(index), len(volumes), total_points, skipped))
     return len(index)
 
 

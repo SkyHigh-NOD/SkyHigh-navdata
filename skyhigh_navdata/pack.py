@@ -277,7 +277,7 @@ def render_release_notes(manifest) -> str:
         "- `CONFIG/nav/` - navaids, fixes, airways, aerodrome positions and "
         "SID/STAR entry-exit points",
         "- `CONFIG/ad/<ICAO>.dat` - airport layouts",
-        "- `CONFIG/bg/` - airspace drawings (`ENR2-1.lst`, per-aerodrome `.lst` "
+        "- `CONFIG/bg/` - airspace drawings (`ENR21.lst`, per-aerodrome `.lst` "
         "and `.draw`)",
         "- `manifest.json` - SHA-256 and size for every file above",
         "",

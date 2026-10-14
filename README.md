@@ -15,7 +15,10 @@ SkyRadar downloads and installs this ZIP from the repository's latest release.
    - `AD-positions` (aerodrome reference points, AD 2)
    - `AD-entry-exit` (SID/STAR entry/exit points, AD 2)
 3. Builds the airspace drawings SkyRadar shows in `CONFIG/bg`:
-   - `ENR2-1.lst` + `ENR2-1/*.draw` (FIR/UIR/TMA/CTA, from ENR 2.1)
+   - `ENR21.lst` + `ENR21/*.draw` (FIR/UIR/TMA/CTA, from ENR 2.1). The
+     volumes are grouped by named area, so each `.draw` is one togglable
+     "sector" on the radar; `ENR21.sectors` carries each one's owning unit,
+     callsign and frequencies.
    - `<ICAO>.lst` + `<ICAO>/*.draw` (local CTR/ATZ/TMZ, from each airport's
      AD 2.17)
 4. Downloads the latest **X-Plane Gateway** airport layout for every aerodrome
@@ -106,8 +109,9 @@ EG_2610.zip
     │   ├── EGLL.dat
     │   └── ...
     ├── bg
-    │   ├── ENR2-1.lst
-    │   ├── ENR2-1
+    │   ├── ENR21.lst
+    │   ├── ENR21.sectors
+    │   ├── ENR21
     │   │   └── *.draw
     │   ├── EGLL.lst
     │   └── EGLL
