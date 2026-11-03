@@ -1,0 +1,20 @@
+language: en-US
+tone_instructions: "Terse and direct. American English. Report real defects, security issues and broken behavior; skip style nits, praise and filler. Never mention AI or any model in suggested code, commit text or comments."
+reviews:
+  profile: chill
+  high_level_summary: true
+  collapse_walkthrough: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "**"
+      instructions: |
+        - Flag anything that would leak secrets, tokens, personal data or internal paths into logs, errors shown to users, or anything served to a browser.
+        - Flag British spellings in user-facing text; the project uses American English.
+        - Flag source maps, comments or debug output that would ship in a production web build.
+        - Prefer pointing at a concrete bug with the failing input over general advice.
+chat:
+  auto_reply: true
