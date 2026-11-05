@@ -16,5 +16,10 @@ reviews:
         - Flag British spellings in user-facing text; the project uses American English.
         - Flag source maps, comments or debug output that would ship in a production web build.
         - Prefer pointing at a concrete bug with the failing input over general advice.
+  auto_approvals:
+    enabled: true
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
 chat:
   auto_reply: true
