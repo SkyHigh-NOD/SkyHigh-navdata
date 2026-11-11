@@ -79,7 +79,23 @@ def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tu
     dest_dir.mkdir(parents=True, exist_ok=True)
     html_dir = dest_dir / "html"
     archive_path = dest_dir / "nats-airac.zip"
-    download_file(zip_url, archive_path, progress_cb=progress_cb)
+
+    # A previous run may already have pulled the (very large) archive down;
+    # a complete ZIP's central directory lives at the end of the file, so a
+    # truncated download fails this check and gets re-downloaded.
+    if archive_path.is_file() and archive_path.stat().st_size > 10_000_000:
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.namelist()
+            if log:
+                log("Found the existing NATS ZIP (%.0f MB) - reusing it, no download."
+                    % (archive_path.stat().st_size / 1e6))
+        except (zipfile.BadZipFile, OSError):
+            if log:
+                log("Existing NATS ZIP is incomplete - re-downloading.")
+            archive_path.unlink()
+    if not archive_path.is_file():
+        download_file(zip_url, archive_path, progress_cb=progress_cb)
     if html_dir.exists():
         shutil.rmtree(html_dir)
     html_dir.mkdir(parents=True, exist_ok=True)

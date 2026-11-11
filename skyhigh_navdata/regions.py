@@ -243,8 +243,21 @@ def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycl
             continue
         if dedupe_families and (_family_keys(airspace["name"]) & dedupe_families):
             continue
-        points = [pt for ring in airspace.get("rings", []) for pt in ring]
-        if not any(in_bbox(bbox, lat, lon) for lat, lon in points):
+        # Bounding-box intersection (cached per airspace) instead of a
+        # point-by-point scan — this runs once per region per build.
+        airspace_bbox = airspace.get("_bbox", "")
+        if airspace_bbox == "":
+            points = [pt for ring in airspace.get("rings", []) for pt in ring]
+            if points:
+                airspace_bbox = (
+                    min(p[0] for p in points), min(p[1] for p in points),
+                    max(p[0] for p in points), max(p[1] for p in points),
+                )
+            airspace["_bbox"] = airspace_bbox
+        if not airspace_bbox:
+            continue
+        if not (airspace_bbox[0] <= bbox[2] and bbox[0] <= airspace_bbox[2]
+                and airspace_bbox[1] <= bbox[3] and bbox[1] <= airspace_bbox[3]):
             continue
         stem = airspace_slug(airspace["name"])
         if stem in seen_stems:
