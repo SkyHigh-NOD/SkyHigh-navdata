@@ -247,7 +247,11 @@ def publish(zips: list, cycle_code: str, cycle_display: str, log) -> None:
         raise RuntimeError("No release ZIPs found")
     zips = [Path(z) for z in zips]
     notes = write_master_notes(zips[0].parent, cycle_display, cycle_code, zips)
-    exists = _gh("release", "view", tag, "--repo", NAVDATA_REPO).returncode == 0
+    # "release not found" is the expected signal to create it — only route
+    # real gh failures through _gh()
+    view = subprocess.run(["gh", "release", "view", tag, "--repo", NAVDATA_REPO],
+                          capture_output=True, text=True)
+    exists = view.returncode == 0
     if exists:
         log("Release %s exists - uploading %d asset(s) with clobber" % (tag, len(zips)))
         for batch in _chunks([str(z) for z in zips], 20):
