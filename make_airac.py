@@ -321,10 +321,11 @@ def main(argv=None) -> int:
         detected_display, html_dir = aip.download_and_extract_airac(
             out_dir / "airac", log=progress.log, progress_cb=_eaip_progress)
         progress.log("Extracted AIRAC archive")
+        # normalize() returns (code, display) — mind the order
         if args.airac:
-            cycle_display, cycle_code = normalize(str(args.airac))
+            cycle_code, cycle_display = normalize(str(args.airac))
         else:
-            cycle_display, cycle_code = normalize(detected_display)
+            cycle_code, cycle_display = normalize(detected_display)
         progress.log("AIRAC cycle: %s (%s)" % (cycle_display, cycle_code))
 
         # 2) nav files --------------------------------------------------------
