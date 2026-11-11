@@ -45,6 +45,22 @@ from skyhigh_navdata.cycle import normalize
 
 NAVDATA_REPO = "SkyHigh-NOD/SkyHigh-navdata"
 
+# Rough share of the total run each step takes — drives the overall percent
+# and ETA. Skipped steps are stepped through and marked done instantly.
+STEP_PLAN = [
+    ("Downloading NATS eAIP", 22),
+    ("Parsing eAIP into CONFIG/nav", 6),
+    ("X-Plane Gateway airport layouts", 14),
+    ("openAIP global exports", 20),
+    ("OurAirports CSV", 2),
+    ("Merging base + openAIP airspace", 5),
+    ("Packaging EG combined ZIP", 5),
+    ("Packaging world ZIP (skymaps)", 5),
+    ("Region ZIPs", 8),
+    ("Publishing to GitHub release", 4),
+    ("Done", 1),
+]
+
 
 # --- Progress display --------------------------------------------------------
 
@@ -67,8 +83,10 @@ def _clock(seconds: float) -> str:
 class Progress:
     """Single-line progress display: bar, percent, detail, elapsed and ETA.
 
-    Steps carry a weight (their rough share of the total run); a background
-    thread redraws the line so long blocking calls still tick.
+    The whole run is planned up front (``plan`` takes (name, weight) pairs);
+    each ``step(name)`` must be declared there, so overall percent and ETA are
+    accurate. A background thread redraws the line so long blocking calls
+    still tick.
     """
 
     WIDTH = 26
@@ -76,26 +94,35 @@ class Progress:
     def __init__(self):
         self._lock = threading.Lock()
         self._started = time.monotonic()
+        self._weights: dict[str, float] = {}
         self._total_weight = 0.0
         self._done_weight = 0.0
         self._step_weight = 0.0
+        self._step_frac = 0.0
         self._step_name = ""
-        self._step_start = self._started
         self._detail = ""
         self._finished = False
+        self._line_len = 0
         _enable_ansi()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     # -- worker API -----------------------------------------------------
 
-    def step(self, name: str, weight: float, detail: str = "") -> None:
+    def plan(self, steps: list) -> None:
         with self._lock:
-            if self._step_weight:
-                self._done_weight += self._step_weight
+            self._weights = {name: float(weight) for name, weight in steps}
+            self._total_weight = sum(weight for _, weight in steps)
+
+    def step(self, name: str, detail: str = "") -> None:
+        """Begin a planned step; skipped steps just advance(1.0) immediately."""
+        with self._lock:
+            if name not in self._weights:
+                raise KeyError("unplanned step: %r" % name)
+            self._done_weight += self._step_weight
+            self._step_weight = self._weights[name]
+            self._step_frac = 0.0
             self._step_name = name
-            self._step_weight = weight
-            self._step_start = time.monotonic()
             self._detail = detail
             self._render()
 
@@ -105,8 +132,6 @@ class Progress:
             if detail:
                 self._detail = detail
             self._render()
-
-    _step_frac = 0.0
 
     def log(self, message: str) -> None:
         with self._lock:
@@ -119,6 +144,7 @@ class Progress:
         with self._lock:
             self._done_weight += self._step_weight
             self._step_weight = 0.0
+            self._step_frac = 0.0
             self._detail = "done"
             self._finished = True
             self._render()
@@ -145,8 +171,9 @@ class Progress:
             frac * 100, bar, name,
             (" - " + detail) if detail else "",
             _clock(elapsed), _clock(eta))
-        line = line[:160]
-        sys.stdout.write("\r" + line + "\x1b[K" if os.name != "nt" else "\r" + line)
+        # fixed-width overwrite: pad so leftovers from longer lines vanish
+        line = line[:150].ljust(150 if len(line) < 150 else len(line))
+        sys.stdout.write("\r" + line)
         sys.stdout.flush()
         self._line_len = len(line)
 
@@ -262,15 +289,15 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    log = None  # progress display carries the output
     progress = Progress()
+    progress.plan(STEP_PLAN)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     region = REGION
 
     try:
         # 1) AIRAC source -----------------------------------------------------
-        progress.step("Downloading NATS eAIP", 22, "waiting for NATS...")
+        progress.step("Downloading NATS eAIP", "waiting for NATS...")
         def _eaip_progress(done: int, total: int) -> None:
             if total:
                 progress.advance(done / total, "%.0f/%.0f MB (%d%%)" % (
@@ -296,17 +323,17 @@ def main(argv=None) -> int:
         progress.log("AIRAC cycle: %s (%s)" % (cycle_display, cycle_code))
 
         # 2) nav files --------------------------------------------------------
-        progress.step("Parsing eAIP into CONFIG/nav", 6, "")
-        result = build_navdata_from_html(html_dir, nav_dir, region, cycle_display, log=progress.log)
+        progress.step("Parsing eAIP into CONFIG/nav", "")
+        result = build_navdata_from_html(html_dir, nav_dir, region, cycle_display, log=None)
         counts = dict(result["counts"])
         icaos = result["icaos"]
 
         # 3) airport layouts --------------------------------------------------
+        progress.step("X-Plane Gateway airport layouts", "0/%d" % len(icaos))
         if args.skip_layouts:
-            progress.step("Airport layouts (skipped)", 1, "")
+            progress.advance(1.0, "skipped")
             counts["layouts"] = 0
         else:
-            progress.step("X-Plane Gateway airport layouts", 14, "0/%d" % len(icaos))
             custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
             summary = aip.download_all_ad_layouts(
                 icaos, ad_dir, log=None, skip=custom_icaos,
@@ -321,12 +348,12 @@ def main(argv=None) -> int:
         # 4) global base ------------------------------------------------------
         base_data = None
         if not args.no_base:
-            progress.step("openAIP global exports", 20, "listing")
+            progress.step("openAIP global exports", "listing")
             openaip = base.load_openaip(
                 Path(args.cache_dir), log=None,
                 progress_cb=lambda done, total, label:
                     progress.advance(done / max(total, 1), label))
-            progress.step("OurAirports CSV", 2, "")
+            progress.step("OurAirports CSV", "")
             ourairports = base.load_ourairports(Path(args.cache_dir), log=progress.log)
             base_data = dict(openaip)
             base_data["ourairports"] = ourairports
@@ -334,7 +361,7 @@ def main(argv=None) -> int:
             counts.update(openaip.get("counts", {}))
 
         # 5) merge + airspace --------------------------------------------------
-        progress.step("Merging base + openAIP airspace", 5, "")
+        progress.step("Merging base + openAIP airspace", "")
         if base_data:
             counts.update(merge.merge_base_into_stage(stage_dir, base_data, log=None))
             added, _group = regions.write_openaip_airspace_group(
@@ -357,7 +384,7 @@ def main(argv=None) -> int:
             encoding="utf-8")
 
         # 6) combined EG ZIP ---------------------------------------------------
-        progress.step("Packaging EG combined ZIP", 5, "")
+        progress.step("Packaging EG combined ZIP", "")
         manifest = pack.build_manifest(
             stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
             generator=GENERATOR_NAME, generator_version=__version__, counts=counts)
@@ -371,7 +398,7 @@ def main(argv=None) -> int:
         # 7) world ZIP ----------------------------------------------------------
         world_zip = None
         if base_data:
-            progress.step("Packaging world ZIP (skymaps)", 5, "")
+            progress.step("Packaging world ZIP (skymaps)", "")
             world_zip = regions.build_global_zip(
                 stage_dir, out_dir, cycle_display, cycle_code,
                 generator_version=__version__, log=progress.log)
@@ -381,7 +408,7 @@ def main(argv=None) -> int:
         region_spec = (args.regions or "").strip().lower()
         if region_spec != "none":
             chosen = regions.resolve_regions(args.regions, stage_dir, args.min_region_airports)
-            progress.step("Region ZIPs", 8, "0/%d" % len(chosen))
+            progress.step("Region ZIPs", "0/%d" % len(chosen))
             for index, prefix in enumerate(chosen, start=1):
                 progress.advance(index / max(len(chosen), 1), prefix)
                 region_zips.append(regions.build_region_zip(
@@ -393,12 +420,14 @@ def main(argv=None) -> int:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
         # 9) publish ------------------------------------------------------------
-        if not args.no_publish:
-            progress.step("Publishing to GitHub release", 4, "checking release")
-            publish(out_dir, cycle_code, cycle_display, progress.log)
+        if args.no_publish:
+            progress.step("Publishing to GitHub release", "skipped (--no-publish)")
+            progress.advance(1.0)
         else:
-            progress.step("Build complete (not published)", 1, "")
+            progress.step("Publishing to GitHub release", "checking release")
+            publish(out_dir, cycle_code, cycle_display, progress.log)
 
+        progress.step("Done", "")
         progress.finish()
         print("Done: AIRAC %s (%s) in %s" % (cycle_display, cycle_code, out_dir))
         return 0
