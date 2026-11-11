@@ -24,14 +24,23 @@ def request_url(url: str) -> Request:
     return Request(url, headers={"User-Agent": USER_AGENT})
 
 
-def download_file(url: str, destination: Path, timeout: int = 120) -> None:
+def download_file(url: str, destination: Path, timeout: int = 120,
+                  progress_cb=None) -> None:
+    """Stream a URL to disk. ``progress_cb(bytes_done, bytes_total)`` fires per
+    chunk when supplied (bytes_total is 0 when the server sends no length)."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(request_url(url), timeout=timeout) as response, destination.open("wb") as output:
+        total_header = response.headers.get("Content-Length")
+        total = int(total_header) if total_header and total_header.isdigit() else 0
+        done = 0
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(512 * 1024)
             if not chunk:
                 break
             output.write(chunk)
+            done += len(chunk)
+            if progress_cb:
+                progress_cb(done, total)
 
 
 # --- NATS UK eAIP -----------------------------------------------------------
@@ -47,8 +56,11 @@ def find_current_nats_airac():
     return "%s/%s" % (cycle.group(1), cycle.group(2)[-2:]), urljoin(NATS_AIP_URL, archive.group(1))
 
 
-def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
-    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir)."""
+def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tuple[str, Path]:
+    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir).
+
+    ``progress_cb(bytes_done, bytes_total)`` tracks the download when supplied.
+    """
     cycle, zip_url = find_current_nats_airac()
     if log:
         log("Detected AIRAC cycle: %s" % cycle)
@@ -57,7 +69,7 @@ def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     html_dir = dest_dir / "html"
     archive_path = dest_dir / "nats-airac.zip"
-    download_file(zip_url, archive_path)
+    download_file(zip_url, archive_path, progress_cb=progress_cb)
     if html_dir.exists():
         shutil.rmtree(html_dir)
     html_dir.mkdir(parents=True, exist_ok=True)

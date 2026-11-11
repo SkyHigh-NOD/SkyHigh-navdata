@@ -270,7 +270,14 @@ def main(argv=None) -> int:
 
     try:
         # 1) AIRAC source -----------------------------------------------------
-        progress.step("Downloading NATS eAIP", 22, "resolving cycle")
+        progress.step("Downloading NATS eAIP", 22, "waiting for NATS...")
+        def _eaip_progress(done: int, total: int) -> None:
+            if total:
+                progress.advance(done / total, "%.0f/%.0f MB (%d%%)" % (
+                    done / 1e6, total / 1e6, done * 100 // total))
+            else:
+                progress.advance(0.5, "%.1f MB downloaded" % (done / 1e6))
+
         stage_dir = out_dir / (".staging-%s" % region)
         if stage_dir.exists():
             shutil.rmtree(stage_dir)
@@ -280,7 +287,8 @@ def main(argv=None) -> int:
         bg_dir = stage_dir / "CONFIG" / "bg"
 
         detected_display, html_dir = aip.download_and_extract_airac(
-            out_dir / "airac", log=progress.log)
+            out_dir / "airac", log=progress.log, progress_cb=_eaip_progress)
+        progress.log("Extracted AIRAC archive")
         if args.airac:
             cycle_display, cycle_code = normalize(str(args.airac))
         else:
