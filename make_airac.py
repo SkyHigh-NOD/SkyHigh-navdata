@@ -210,9 +210,9 @@ def _zip_summary(path: Path) -> dict:
     }
 
 
-def write_master_notes(out_dir: Path, cycle_display: str, cycle_code: str) -> Path:
-    """Release notes covering every published asset (combined + world + regions)."""
-    zips = sorted(out_dir.glob("*_%s.zip" % cycle_code))
+def write_master_notes(out_dir: Path, cycle_display: str, cycle_code: str,
+                       zips: list) -> Path:
+    """Release notes covering every published asset."""
     summaries = [_zip_summary(z) for z in zips]
     lines = [
         "# AIRAC %s - SkyHigh navdata" % cycle_display,
@@ -227,8 +227,8 @@ def write_master_notes(out_dir: Path, cycle_display: str, cycle_code: str) -> Pa
             summary["name"], summary["region"], summary["files"], summary["size_mb"]))
     lines += [
         "",
-        "- `EG_<cycle>.zip` - full EG package for SkyRadar (global nav base merged "
-        "under the SkyHigh data, openAIP airspace)",
+        "- `<cycle>.zip` - everything in one package: the global nav base merged "
+        "under the SkyHigh data, openAIP airspace",
         "- `ALL_<cycle>.zip` - world package for skymaps",
         "- `<REGION>_<cycle>.zip` - per-region subsets derived automatically",
         "",
@@ -240,13 +240,13 @@ def write_master_notes(out_dir: Path, cycle_display: str, cycle_code: str) -> Pa
     return path
 
 
-def publish(out_dir: Path, cycle_code: str, cycle_display: str, log) -> None:
+def publish(zips: list, cycle_code: str, cycle_display: str, log) -> None:
     tag = "airac-%s" % cycle_code
-    title = "AIRAC %s - EG SkyRadar navdata" % cycle_display
-    zips = sorted(out_dir.glob("*_%s.zip" % cycle_code))
+    title = "AIRAC %s - SkyHigh navdata" % cycle_display
     if not zips:
-        raise RuntimeError("No release ZIPs found in %s" % out_dir)
-    notes = write_master_notes(out_dir, cycle_display, cycle_code)
+        raise RuntimeError("No release ZIPs found")
+    zips = [Path(z) for z in zips]
+    notes = write_master_notes(zips[0].parent, cycle_display, cycle_code, zips)
     exists = _gh("release", "view", tag, "--repo", NAVDATA_REPO).returncode == 0
     if exists:
         log("Release %s exists - uploading %d asset(s) with clobber" % (tag, len(zips)))
@@ -281,6 +281,10 @@ def parse_args(argv=None):
     parser.add_argument("--min-region-airports", type=int, default=10)
     parser.add_argument("--no-publish", action="store_true",
                         help="Build only; do not create/upload the GitHub release.")
+    parser.add_argument("--single", action="store_true",
+                        help="Publish ONE asset per cycle: <cycle>.zip (e.g. 2611.zip) "
+                             "containing everything - the global base merged under the "
+                             "SkyHigh data. No world/region ZIPs.")
     parser.add_argument("--keep-staging", action="store_true",
                         help="Keep the intermediate staging tree for debugging.")
     parser.add_argument("--out", default="dist")
@@ -384,21 +388,29 @@ def main(argv=None) -> int:
                 GENERATOR_NAME, __version__),
             encoding="utf-8")
 
-        # 6) combined EG ZIP ---------------------------------------------------
-        progress.step("Packaging EG combined ZIP", "")
+        # 6) the release ZIP/ZIPs --------------------------------------------
+        # Single mode: one <cycle>.zip with everything in it (the manifest
+        # keeps region EG so a future SkyRadar retarget still installs it).
+        single = args.single
+        progress.step("Packaging the release ZIP", "")
         manifest = pack.build_manifest(
             stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
             generator=GENERATOR_NAME, generator_version=__version__, counts=counts)
         pack.write_manifest(stage_dir, manifest)
-        eg_zip = pack.make_zip(stage_dir, out_dir / pack.asset_name(region, cycle_code))
+        asset_name = ("%s.zip" % cycle_code) if single else pack.asset_name(region, cycle_code)
+        eg_zip = pack.make_zip(stage_dir, out_dir / asset_name)
         problems = pack.verify_zip(eg_zip, manifest, counts)
         if problems:
             raise RuntimeError("Combined ZIP failed verification: %s" % "; ".join(problems))
-        pack.write_release_notes(eg_zip.with_suffix(".md"), manifest)
+        if not single:
+            pack.write_release_notes(eg_zip.with_suffix(".md"), manifest)
 
         # 7) world ZIP ----------------------------------------------------------
         world_zip = None
-        if base_data:
+        if single:
+            progress.step("Packaging world ZIP (skymaps)", "skipped (--single)")
+            progress.advance(1.0)
+        elif base_data:
             progress.step("Packaging world ZIP (skymaps)", "")
             world_zip = regions.build_global_zip(
                 stage_dir, out_dir, cycle_display, cycle_code,
@@ -407,7 +419,10 @@ def main(argv=None) -> int:
         # 8) region ZIPs --------------------------------------------------------
         region_zips = []
         region_spec = (args.regions or "").strip().lower()
-        if region_spec != "none":
+        if single:
+            progress.step("Region ZIPs", "skipped (--single)")
+            progress.advance(1.0)
+        elif region_spec != "none":
             chosen = regions.resolve_regions(args.regions, stage_dir, args.min_region_airports)
             progress.step("Region ZIPs", "0/%d" % len(chosen))
             for index, prefix in enumerate(chosen, start=1):
@@ -421,12 +436,16 @@ def main(argv=None) -> int:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
         # 9) publish ------------------------------------------------------------
+        release_zips = [eg_zip]
+        if world_zip:
+            release_zips.append(world_zip)
+        release_zips.extend(z for z in region_zips if z)
         if args.no_publish:
             progress.step("Publishing to GitHub release", "skipped (--no-publish)")
             progress.advance(1.0)
         else:
             progress.step("Publishing to GitHub release", "checking release")
-            publish(out_dir, cycle_code, cycle_display, progress.log)
+            publish(release_zips, cycle_code, cycle_display, progress.log)
 
         progress.step("Done", "")
         progress.finish("done")
