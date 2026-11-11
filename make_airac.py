@@ -168,7 +168,15 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     # 4) layouts ------------------------------------------------------------------
     progress.step("X-Plane Gateway airport layouts", "")
     if "layouts" in only:
-        if not icaos:
+        layout_scope = getattr(args, "layouts", "eg")
+        if layout_scope == "world":
+            positions_path = nav_dir / "AD-positions"
+            icaos = [line.split()[0].upper()
+                     for line in positions_path.read_text(
+                         encoding="utf-8", errors="replace").splitlines()
+                     if line.strip() and line.split()[0][:1].isalpha()]
+            progress.log("worldwide layouts: %d aerodrome(s) requested" % len(icaos))
+        elif not icaos:
             positions_path = nav_dir / "AD-positions"
             if positions_path.is_file():
                 icaos = [line.split()[0].upper()
@@ -216,11 +224,16 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
             oaip_dir = bg_dir / "OAIP"
             if oaip_dir.is_dir():
                 shutil.rmtree(oaip_dir)
-            added, _group = regions.write_openaip_airspace_group(
-                bg_dir, base_data.get("airspaces", []),
-                regions.EG_REGION["bbox"], cycle_display,
-                countries=regions.EG_REGION["countries"])
-            progress.log("airspace: %d openAIP drawing(s)" % added)
+            if getattr(args, "airspace_scope", "eg") == "world":
+                added = regions.write_world_airspace_groups(
+                    bg_dir, base_data.get("airspaces", []), cycle_display)
+                progress.log("airspace: %d worldwide openAIP drawing(s)" % added)
+            else:
+                added, _group = regions.write_openaip_airspace_group(
+                    bg_dir, base_data.get("airspaces", []),
+                    regions.EG_REGION["bbox"], cycle_display,
+                    countries=regions.EG_REGION["countries"])
+                progress.log("airspace: %d EG-scope openAIP drawing(s)" % added)
         progress.advance(1.0)
     else:
         progress.advance(1.0, "kept")
@@ -507,6 +520,15 @@ def parse_args(argv=None):
     parser.add_argument("--regions", default=None,
                         help="'auto' (default), a comma list of ICAO prefixes, or 'none'.")
     parser.add_argument("--min-region-airports", type=int, default=10)
+    parser.add_argument("--airspace-scope", choices=("eg", "world"), default="eg",
+                        help="Airspace drawings scope: 'eg' (UK+Ireland, the combined "
+                             "build) or 'world' (every openAIP country, bucketed into "
+                             "per-country .lst groups). Default: %(default)s.")
+    parser.add_argument("--layouts", choices=("eg", "world"), default="eg",
+                        help="Aerodrome layout scope: 'eg' (the eAIP aerodromes, "
+                             "~116 layouts) or 'world' (every aerodrome in the merged "
+                             "navdata — 40k+ Gateway requests, hours). "
+                             "Default: %(default)s.")
     parser.add_argument("--no-publish", action="store_true",
                         help="Build only; do not create/upload the GitHub release.")
     parser.add_argument("--single", action="store_true",
@@ -582,24 +604,7 @@ def main(argv=None) -> int:
         counts = dict(result["counts"])
         icaos = result["icaos"]
 
-        # 3) airport layouts --------------------------------------------------
-        progress.step("X-Plane Gateway airport layouts", "0/%d" % len(icaos))
-        if args.skip_layouts:
-            progress.advance(1.0, "skipped")
-            counts["layouts"] = 0
-        else:
-            custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
-            summary = aip.download_all_ad_layouts(
-                icaos, ad_dir, log=None, skip=custom_icaos,
-                progress_cb=lambda done, total, icao:
-                    progress.advance(done / max(total, 1),
-                                     "%s (%d/%d)" % (icao, done, total)))
-            counts.update({k: summary[k] for k in
-                           ("downloaded", "custom", "unavailable", "failed")
-                           if k in summary})
-            counts["layouts"] = summary["downloaded"]
-
-        # 4) global base ------------------------------------------------------
+        # 3) global base ------------------------------------------------------
         base_data = None
         if not args.no_base:
             progress.step("openAIP global exports", "listing")
@@ -614,15 +619,51 @@ def main(argv=None) -> int:
             counts.update(ourairports.get("counts", {}))
             counts.update(openaip.get("counts", {}))
 
-        # 5) merge + airspace --------------------------------------------------
+        # 4) merge + airspace ---------------------------------------------------
+        # Base merges before layouts: worldwide layouts need the merged,
+        # worldwide aerodrome list.
         progress.step("Merging base + openAIP airspace", "")
         if base_data:
             counts.update(merge.merge_base_into_stage(stage_dir, base_data, log=None))
-            added, _group = regions.write_openaip_airspace_group(
-                bg_dir, base_data.get("airspaces", []),
-                regions.EG_REGION["bbox"], cycle_display,
-                countries=regions.EG_REGION["countries"])
+            if args.airspace_scope == "world":
+                added = regions.write_world_airspace_groups(
+                    bg_dir, base_data.get("airspaces", []), cycle_display)
+                progress.log("airspace: %d worldwide openAIP drawing(s) "
+                             "(per-country groups)" % added)
+            else:
+                added, _group = regions.write_openaip_airspace_group(
+                    bg_dir, base_data.get("airspaces", []),
+                    regions.EG_REGION["bbox"], cycle_display,
+                    countries=regions.EG_REGION["countries"])
+                progress.log("airspace: %d EG-scope openAIP drawing(s)" % added)
             counts["airspace_drawings"] = added
+
+        # 5) airport layouts ----------------------------------------------------
+        progress.step("X-Plane Gateway airport layouts", "")
+        if args.skip_layouts:
+            progress.advance(1.0, "skipped")
+            counts["layouts"] = 0
+        else:
+            if args.layouts == "world":
+                # every aerodrome in the merged worldwide list; the Gateway
+                # 404s the ones it does not know, so expect a large
+                # 'unavailable' count and a multi-hour run
+                positions = stage_dir / "CONFIG" / "nav" / "AD-positions"
+                icaos = [line.split()[0].upper()
+                         for line in positions.read_text(
+                             encoding="utf-8", errors="replace").splitlines()
+                         if line.strip() and line.split()[0][:1].isalpha()]
+                progress.log("worldwide layouts: %d aerodrome(s) requested" % len(icaos))
+            custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
+            summary = aip.download_all_ad_layouts(
+                icaos, ad_dir, log=None, skip=custom_icaos,
+                progress_cb=lambda done, total, icao:
+                    progress.advance(done / max(total, 1),
+                                     "%s (%d/%d)" % (icao, done, total)))
+            counts.update({k: summary[k] for k in
+                           ("downloaded", "custom", "unavailable", "failed")
+                           if k in summary})
+            counts["layouts"] = summary["downloaded"]
 
         # hand-maintained overrides always win
         overrides_dir = Path(__file__).resolve().parent / "CONFIG"

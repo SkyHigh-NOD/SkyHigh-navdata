@@ -37,6 +37,9 @@ EG_REGION = {
     "countries": ("GB", "IE"),
 }
 
+# Everything, for worldwide airspace packaging.
+WORLD_BBOX = (-90.0, -180.0, 90.0, 180.0)
+
 # Regions whose ICAO codes are region + three letters (not two-letter country
 # prefixes); everything else groups by the first two letters.
 SINGLE_LETTER_REGIONS = {"K", "C", "Y"}
@@ -222,6 +225,24 @@ def _family_keys(name: str) -> set:
         if len(tokens) >= width:
             keys.add(" ".join(tokens[:width]))
     return keys
+
+
+def write_world_airspace_groups(bg_dir: Path, airspaces: list, airac_cycle: str) -> int:
+    """Every openAIP airspace, bucketed into per-country .lst groups
+    (``OAIP<ISO>`` — letters/digits only, as SkyRadar's launcher requires).
+
+    Returns the total drawing count. Countries with no drawing are skipped.
+    """
+    by_country: dict = {}
+    for airspace in airspaces:
+        by_country.setdefault(airspace.get("country") or "XX", []).append(airspace)
+    total = 0
+    for country in sorted(by_country):
+        added, _group = write_openaip_airspace_group(
+            bg_dir, by_country[country], WORLD_BBOX, airac_cycle,
+            group="OAIP" + country)
+        total += added
+    return total
 
 
 def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycle: str,
