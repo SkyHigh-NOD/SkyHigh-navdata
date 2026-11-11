@@ -46,6 +46,24 @@ pip install -r requirements.txt
 
 ## Usage
 
+### One command for a whole cycle
+
+```
+python make_airac.py                      # build + publish the current cycle
+python make_airac.py --no-publish         # build only
+python make_airac.py --airac 2611         # force a cycle label
+python make_airac.py --regions LF,ED,K    # restrict per-region ZIPs
+```
+
+`make_airac.py` runs the whole pipeline with a live progress bar (overall
+percent, elapsed time and ETA): NATS eAIP download → CONFIG/nav parse →
+X-Plane Gateway layouts → openAIP + OurAirports global base → merge →
+combined `EG_<airac>.zip`, world `ALL_<airac>.zip` for skymaps and one ZIP
+per ICAO region → publish to the GitHub release (tag `airac-<cycle>`,
+via `gh`; requires the GitHub CLI installed and authenticated).
+
+### Manual steps
+
 ```
 python build_navdata.py                           # full build (nav + airspace + layouts)
 python build_navdata.py --skip-layouts            # everything except X-Plane layouts

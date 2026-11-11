@@ -56,8 +56,10 @@ def _download_to(url: str, path: Path, timeout: int = 300) -> None:
 
 # --- openAIP -----------------------------------------------------------------
 
-def load_openaip(cache_dir: Path, log=None) -> dict:
+def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
     """Download and parse the openAIP exports into one dataset.
+
+    ``progress_cb(done, total, label)`` fires per export file when supplied.
 
     Returns a dict with ``airports`` (icao → record), ``navaids``
     (ident → record), ``fixes`` (name → (lat, lon)) and ``airspaces`` (list),
@@ -78,7 +80,12 @@ def load_openaip(cache_dir: Path, log=None) -> dict:
     airspaces: list = []
 
     changed = 0
+    total = len(listing)
+    done = 0
     for key, info in sorted(listing.items()):
+        done += 1
+        if progress_cb:
+            progress_cb(done, total, key)
         stamp = info.get("last_modified", "")
         path = cache_dir / "openaip" / key.replace("_", "__")
         if cache.get(key) != stamp or not path.is_file():

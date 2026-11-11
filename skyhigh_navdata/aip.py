@@ -176,37 +176,41 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
     return True
 
 
-def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None) -> dict:
+def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None, progress_cb=None) -> dict:
     """Download one apt.dat per aerodrome into ``ad_dir``. Returns a counts summary.
 
     ``skip`` is an optional collection of ICAOs that already have a local
     override; those are left for the caller to supply instead of downloading.
+    ``progress_cb(done, total, icao)`` is called per aerodrome when supplied.
     """
     ad_dir = Path(ad_dir)
     ad_dir.mkdir(parents=True, exist_ok=True)
     skip = {code.upper() for code in skip} if skip else set()
     downloaded = unavailable = failed = custom = 0
     layouts = []
+    total = len(icaos)
     for index, icao in enumerate(icaos, start=1):
         if icao.upper() in skip:
             custom += 1
             if log:
-                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, len(icaos), icao))
-            continue
-        output = ad_dir / (icao.upper() + ".dat")
-        if log:
-            log("[%d/%d] X-Plane Gateway layout: %s" % (index, len(icaos), icao))
-        try:
-            if write_gateway_layout(icao, output, log):
-                downloaded += 1
-                layouts.append(icao.upper())
-            else:
-                unavailable += 1
-        except Exception as error:  # noqa: BLE001 - keep going on individual failures
-            failed += 1
+                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, total, icao))
+        else:
+            output = ad_dir / (icao.upper() + ".dat")
             if log:
-                log("Failed to download %s layout: %s" % (icao, error))
-        time.sleep(0.25)
+                log("[%d/%d] X-Plane Gateway layout: %s" % (index, total, icao))
+            try:
+                if write_gateway_layout(icao, output, log):
+                    downloaded += 1
+                    layouts.append(icao.upper())
+                else:
+                    unavailable += 1
+            except Exception as error:  # noqa: BLE001 - keep going on individual failures
+                failed += 1
+                if log:
+                    log("Failed to download %s layout: %s" % (icao, error))
+            time.sleep(0.25)
+        if progress_cb:
+            progress_cb(index, total, icao)
     if log:
         log("Airport layouts complete: %d downloaded, %d overridden, %d unavailable, %d failed."
             % (downloaded, custom, unavailable, failed))

@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from skyhigh_navdata import aip, GENERATOR_NAME, REGION, __version__
-from skyhigh_navdata import base, firs, merge, pack
+from skyhigh_navdata import base, merge, pack, regions
 from skyhigh_navdata.airspace import build_airspace_from_html
 from skyhigh_navdata.build import build_navdata_from_html
 from skyhigh_navdata.cycle import CycleError, normalize
@@ -72,10 +72,14 @@ def parse_args(argv=None):
     parser.add_argument("--no-base", action="store_true",
                         help="Do not merge the global base data (openAIP + OurAirports) "
                              "under the SkyHigh data.")
-    parser.add_argument("--firs", default=None,
-                        help="Comma-separated FIR ids to also package individually, "
-                             "e.g. 'EGTT,EISN' (default: every FIR in FIRS). "
-                             "Pass 'none' to build only the combined ZIP.")
+    parser.add_argument("--regions", default=None,
+                        help="Which per-region ZIPs to also build: 'auto' (default) "
+                             "derives every ICAO region prefix from the staged "
+                             "aerodromes, a comma list builds exactly those (e.g. "
+                             "'LF,ED,K'), and 'none' builds none of them.")
+    parser.add_argument("--min-region-airports", type=int, default=10,
+                        help="With --regions auto, only build regions with at least "
+                             "this many aerodromes. Default: %(default)s")
     parser.add_argument("--cache-dir", default=".cache",
                         help="Where base-data downloads are cached. Default: %(default)s")
     parser.add_argument("--overrides-dir", default=None,
@@ -216,10 +220,10 @@ def main(argv=None) -> int:
         else:
             log("Building airspace drawings from openAIP exports "
                 "(replacing the broken eAIP airspace) ...")
-            added, _group = firs.write_openaip_airspace_group(
+            added, _group = regions.write_openaip_airspace_group(
                 bg_dir, base_data.get("airspaces", []),
-                firs.EG_REGION["bbox"], cycle_display,
-                countries=firs.EG_REGION["countries"])
+                regions.EG_REGION["bbox"], cycle_display,
+                countries=regions.EG_REGION["countries"])
             counts["airspace_drawings"] = added
             sources["airspace"] = "openAIP daily exports (replaces eAIP airspace)"
     else:
@@ -284,14 +288,20 @@ def main(argv=None) -> int:
             "antivirus scanner). Add the build folder to your antivirus exclusions, then "
             "rebuild." % ("\n  - ".join(problems), stage_dir))
 
-    # Per-FIR subsets of the finished tree (the combined ZIP is untouched).
-    fir_zips = []
-    fir_spec = (args.firs or "").strip().lower()
-    if fir_spec != "none":
-        chosen = firs.resolve_firs(args.firs if args.firs else None)
-        for fir_id, fir_def in chosen.items():
-            fir_zips.append(firs.build_fir_zip(
-                fir_id, fir_def, stage_dir, out_dir,
+    # The world ZIP for skymaps (the fully merged tree, re-manifested as
+    # region ALL), then per-region subsets. The combined ZIP is built and
+    # verified above, so its manifest is already sealed.
+    world_zip = None
+    region_zips = []
+    if not args.no_base:
+        world_zip = regions.build_global_zip(
+            stage_dir, out_dir, cycle_display, cycle_code,
+            generator_version=__version__, log=log)
+    region_spec = (args.regions or "").strip().lower()
+    if region_spec != "none":
+        for prefix in regions.resolve_regions(args.regions, stage_dir, args.min_region_airports):
+            region_zips.append(regions.build_region_zip(
+                prefix, stage_dir, out_dir,
                 cycle_display, cycle_code,
                 base_airspaces=(base_data or {}).get("airspaces"),
                 generator_version=__version__,
@@ -312,9 +322,11 @@ def main(argv=None) -> int:
     print("  AIRAC cycle : %s (%s)" % (cycle_display, cycle_code), flush=True)
     print("  Files       : %d (%.2f MB)" % (len(manifest["files"]), size_mb), flush=True)
     print("  Counts      : %s" % ", ".join("%s=%s" % item for item in sorted(counts.items())), flush=True)
-    for fir_zip in fir_zips:
-        if fir_zip:
-            print("  FIR release : %s" % fir_zip.name, flush=True)
+    if world_zip:
+        print("  World ZIP   : %s" % world_zip.name, flush=True)
+    for region_zip in region_zips:
+        if region_zip:
+            print("  Region ZIP  : %s" % region_zip.name, flush=True)
     if notes_path:
         print("  Notes       : %s" % notes_path, flush=True)
     print("", flush=True)
