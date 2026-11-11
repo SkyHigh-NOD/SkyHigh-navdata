@@ -196,7 +196,12 @@ def main(argv=None) -> int:
         log("Applying local overrides from %s ..." % overrides_dir)
         applied = pack.apply_overrides(stage_dir, overrides_dir, log=log)
         counts["overrides"] = len(applied)
-        sources["overrides"] = ("%d file(s) from %s" % (len(applied), overrides_dir)
+        # The manifest and the release notes are published. They name where
+        # the overrides came from in words, never as the builder's own path.
+        origin = ("the repository's CONFIG folder"
+                  if overrides_dir.resolve() == DEFAULT_OVERRIDES_DIR
+                  else "a folder given with --overrides-dir")
+        sources["overrides"] = ("%d file(s) from %s" % (len(applied), origin)
                                 if applied else "none")
     else:
         sources["overrides"] = "none"
@@ -215,6 +220,11 @@ def main(argv=None) -> int:
         sources=sources, counts=counts, overrides=applied,
         generator=GENERATOR_NAME, generator_version=__version__,
     )
+    leaked = pack.local_paths_in(manifest)
+    if leaked:
+        raise RuntimeError(
+            "The manifest would publish a path from this machine (%s). "
+            "Describe the source in words instead." % ", ".join(leaked))
     pack.write_manifest(stage_dir, manifest)
 
     out_name = args.name or pack.asset_name(region, cycle_code)
