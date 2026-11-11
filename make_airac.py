@@ -54,7 +54,7 @@ STEP_PLAN = [
     ("openAIP global exports", 20),
     ("OurAirports CSV", 2),
     ("Merging base + openAIP airspace", 5),
-    ("Packaging EG combined ZIP", 5),
+    ("Packaging the release ZIP", 5),
     ("Packaging world ZIP (skymaps)", 5),
     ("Region ZIPs", 8),
     ("Publishing to GitHub release", 4),
