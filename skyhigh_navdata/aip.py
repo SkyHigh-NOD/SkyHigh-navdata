@@ -27,11 +27,21 @@ def request_url(url: str) -> Request:
 def download_file(url: str, destination: Path, timeout: int = 120,
                   progress_cb=None) -> None:
     """Stream a URL to disk. ``progress_cb(bytes_done, bytes_total)`` fires per
-    chunk when supplied (bytes_total is 0 when the server sends no length)."""
+    chunk when supplied. When the server omits Content-Length on the GET, a
+    HEAD request fills the gap; 0 means genuinely unknown."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(request_url(url), timeout=timeout) as response, destination.open("wb") as output:
         total_header = response.headers.get("Content-Length")
         total = int(total_header) if total_header and total_header.isdigit() else 0
+        if not total:
+            try:
+                with urlopen(Request(url, headers={"User-Agent": USER_AGENT},
+                                     method="HEAD"), timeout=30) as head:
+                    head_length = head.headers.get("Content-Length")
+                    if head_length and head_length.isdigit():
+                        total = int(head_length)
+            except OSError:
+                pass
         done = 0
         while True:
             chunk = response.read(512 * 1024)

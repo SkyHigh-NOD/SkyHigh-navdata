@@ -140,12 +140,12 @@ class Progress:
             sys.stdout.flush()
             self._render()
 
-    def finish(self) -> None:
+    def finish(self, label: str = "done") -> None:
         with self._lock:
             self._done_weight += self._step_weight
             self._step_weight = 0.0
             self._step_frac = 0.0
-            self._detail = "done"
+            self._detail = label
             self._finished = True
             self._render()
         sys.stdout.write("\n")
@@ -171,8 +171,9 @@ class Progress:
             frac * 100, bar, name,
             (" - " + detail) if detail else "",
             _clock(elapsed), _clock(eta))
-        # fixed-width overwrite: pad so leftovers from longer lines vanish
-        line = line[:150].ljust(150 if len(line) < 150 else len(line))
+        # never exceed the console width — a wrapped line defeats the \r
+        width = max(40, shutil.get_terminal_size((100, 24)).columns - 2)
+        line = line[:width].ljust(width)
         sys.stdout.write("\r" + line)
         sys.stdout.flush()
         self._line_len = len(line)
@@ -428,14 +429,15 @@ def main(argv=None) -> int:
             publish(out_dir, cycle_code, cycle_display, progress.log)
 
         progress.step("Done", "")
-        progress.finish()
+        progress.finish("done")
         print("Done: AIRAC %s (%s) in %s" % (cycle_display, cycle_code, out_dir))
         return 0
     except KeyboardInterrupt:
-        progress.finish()
+        progress.finish("STOPPED")
+        print("Stopped by user.", file=sys.stderr)
         return 130
     except Exception as error:  # noqa: BLE001 - surface after closing the bar
-        progress.finish()
+        progress.finish("FAILED")
         print("FAILED: %s" % error, file=sys.stderr)
         return 1
 
