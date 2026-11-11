@@ -72,6 +72,26 @@ python build_navdata.py --airac 2610 --source-dir ./html   # offline from extrac
 python build_navdata.py --airac-zip AIRAC-10-26.zip
 ```
 
+### Selective regeneration
+
+Don't rebuild everything for one change — regenerate just the part you need
+from the existing navdata (staged from the newest ZIP in `dist/`, or
+`--from-zip <path>`):
+
+```
+python make_airac.py --only airways                     # airways only, then repackage
+python make_airac.py --only navaids,fixes               # both, plus the base re-merge
+python make_airac.py --only layouts --no-publish        # re-pull X-Plane layouts
+python make_airac.py --only airspace                    # refresh openAIP airspace
+python make_airac.py --only download,ad-positions       # fresh eAIP + aerodrome positions
+```
+
+Items: `download` (NATS eAIP), `fixes`, `navaids`, `airways`, `ad-positions`,
+`entry-exit`, `ctr`, `layouts` (X-Plane Gateway), `airspace` (openAIP
+drawings). The global base re-merges automatically after any nav
+regeneration, and the result is packaged under the seed ZIP's name and
+published unless `--no-publish`.
+
 `--airac` accepts `2610` (YYMM), `10/26`, or `202610`. When omitted it is
 detected from NATS. Useful flags: `--out dist`, `--name`, `--work-dir`,
 `--skip-layouts`, `--skip-airspace`, `--overrides-dir`, `--no-overrides`,

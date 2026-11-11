@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skyhigh_navdata import GENERATOR_NAME, REGION, __version__
 from skyhigh_navdata import aip, base, merge, pack, regions
+from skyhigh_navdata import build as build_navdata
 from skyhigh_navdata.build import build_navdata_from_html
 from skyhigh_navdata.cycle import normalize
 
@@ -60,6 +61,229 @@ STEP_PLAN = [
     ("Publishing to GitHub release", 4),
     ("Done", 1),
 ]
+
+# Selective regeneration (--only): the individual pieces of CONFIG/nav plus
+# the layout, airspace and eAIP-download steps.
+def _zip_cycle(zip_path: Path) -> tuple[str, str]:
+    """(airac_code, airac_display) from a built navdata ZIP's manifest."""
+    with zipfile.ZipFile(zip_path) as archive:
+        manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+    return (str(manifest.get("airac_code") or ""),
+            str(manifest.get("airac") or ""))
+
+
+def run_selective(args, progress, out_dir: Path, only: set) -> int:
+    """Regenerate part of an existing navdata in place.
+
+    Seeds the staging tree from an existing ZIP (--from-zip or the newest in
+    out_dir), runs just the requested generators against the cached eAIP HTML,
+    re-merges the global base (regeneration wipes merged entries), re-packages
+    under the seed ZIP's name and publishes.
+    """
+    region = REGION
+    stage_dir = out_dir / (".staging-%s" % region)
+
+    # 1) seed staging + cycle ---------------------------------------------------
+    progress.step("Downloading NATS eAIP", "seeding staging")
+    seed = args.from_zip
+    if not seed:
+        candidates = [p for p in out_dir.glob("*.zip")
+                      if p.stat().st_size > 100_000]
+        if candidates:
+            seed = str(max(candidates, key=lambda p: p.stat().st_mtime))
+    if not (stage_dir / "CONFIG").exists():
+        if not seed or not Path(seed).is_file():
+            progress.finish("FAILED")
+            print("No staging tree and no seed ZIP found. Run the full build once, "
+                  "or pass --from-zip <path>.", file=sys.stderr)
+            return 1
+        progress.log("Seeding staging from %s" % seed)
+        with zipfile.ZipFile(seed) as archive:
+            archive.extractall(stage_dir)
+    manifest_path = stage_dir / "manifest.json"
+    if manifest_path.is_file():
+        try:
+            seed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            cycle_code = str(seed_manifest.get("airac_code") or "")
+            cycle_display = str(seed_manifest.get("airac") or "")
+        except ValueError:
+            cycle_code, cycle_display = "", ""
+    else:
+        cycle_code, cycle_display = "", ""
+    if not cycle_code:
+        progress.finish("FAILED")
+        print("The seed navdata has no manifest.json.", file=sys.stderr)
+        return 1
+    progress.log("AIRAC cycle: %s (%s) - regenerating: %s"
+                 % (cycle_display, cycle_code, ", ".join(sorted(only))))
+    progress.advance(1.0, "staging seeded")
+
+    html_dir = out_dir / "airac" / "html"
+    nav_wanted = sorted(only & set(NAV_ITEMS))
+
+    # 2) eAIP HTML availability -------------------------------------------------
+    if "download" in only:
+        progress.advance(0.1, "re-downloading NATS eAIP")
+        zip_path = out_dir / "airac" / "nats-airac.zip"
+        if zip_path.exists():
+            zip_path.unlink()
+        _detected, html_dir2 = aip.download_and_extract_airac(
+            out_dir / "airac", log=progress.log)
+        html_dir = html_dir2
+        progress.advance(1.0, "eAIP refreshed")
+    elif nav_wanted and not html_dir.is_dir():
+        progress.finish("FAILED")
+        print("eAIP HTML is not cached (dist/airac/html). Add 'download' to --only.",
+              file=sys.stderr)
+        return 1
+
+    # 3) regenerate the requested nav files --------------------------------------
+    progress.step("Parsing eAIP into CONFIG/nav",
+                  "regenerating: %s" % (", ".join(nav_wanted) or "none"))
+    nav_dir = stage_dir / "CONFIG" / "nav"
+    icaos = []
+    if nav_wanted:
+        builder_map = {
+            "fixes": lambda: build_navdata.build_fixes_from_html(
+                html_dir, nav_dir, cycle_display, log=None),
+            "navaids": lambda: build_navdata.build_navaids_from_html(
+                html_dir, nav_dir, region, cycle_display, log=None),
+            "airways": lambda: build_navdata.build_airways_from_html(
+                html_dir, nav_dir, region, cycle_display, log=None),
+            "ad-positions": lambda: build_navdata.build_ad_positions_from_html(
+                html_dir, nav_dir, region, cycle_display, log=None),
+            "entry-exit": lambda: build_navdata.build_ad_entry_exit_from_html(
+                html_dir, nav_dir, region, cycle_display, log=None),
+            "ctr": lambda: build_navdata.build_ctr_positions(
+                nav_dir, cycle_display, log=None),
+        }
+        for index, name in enumerate(nav_wanted, start=1):
+            progress.advance((index - 1) / len(nav_wanted), name)
+            result = builder_map[name]()
+            progress.log("%s: regenerated" % name)
+        progress.advance(1.0)
+    else:
+        progress.advance(1.0, "kept")
+
+    # 4) layouts ------------------------------------------------------------------
+    progress.step("X-Plane Gateway airport layouts", "")
+    if "layouts" in only:
+        if not icaos:
+            positions_path = nav_dir / "AD-positions"
+            if positions_path.is_file():
+                icaos = [line.split()[0].upper()
+                         for line in positions_path.read_text(
+                             encoding="utf-8", errors="replace").splitlines()
+                         if line.strip() and line.split()[0][:1].isalpha()]
+        ad_dir = stage_dir / "CONFIG" / "ad"
+        custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
+        summary = aip.download_all_ad_layouts(
+            icaos, ad_dir, log=None, skip=custom_icaos,
+            progress_cb=lambda done, total, icao:
+                progress.advance(done / max(total, 1),
+                                 "%s (%d/%d)" % (icao, done, total)))
+        progress.log("layouts: %d downloaded, %d failed"
+                     % (summary["downloaded"], summary["failed"]))
+        progress.advance(1.0)
+    else:
+        progress.advance(1.0, "kept")
+
+    # 5) base data + merge ---------------------------------------------------------
+    base_data = None
+    need_nav_merge = bool(nav_wanted)
+    if "airspace" in only or need_nav_merge:
+        progress.step("openAIP global exports", "listing")
+        openaip = base.load_openaip(
+            Path(args.cache_dir), log=None,
+            progress_cb=lambda done, total, label:
+                progress.advance(done / max(total, 1), label))
+        base_data = dict(openaip)
+        if need_nav_merge:
+            progress.step("OurAirports CSV", "")
+            ourairports = base.load_ourairports(Path(args.cache_dir), log=progress.log)
+            base_data["ourairports"] = ourairports
+
+    progress.step("Merging base + openAIP airspace", "")
+    if need_nav_merge and base_data:
+        counts_update = merge.merge_base_into_stage(stage_dir, base_data, log=None)
+        progress.log("base merge: %s"
+                     % ", ".join("%s=%d" % item for item in counts_update.items()))
+    else:
+        progress.advance(0.5, "nav files kept")
+    if "airspace" in only:
+        if base_data:
+            bg_dir = stage_dir / "CONFIG" / "bg"
+            oaip_dir = bg_dir / "OAIP"
+            if oaip_dir.is_dir():
+                shutil.rmtree(oaip_dir)
+            added, _group = regions.write_openaip_airspace_group(
+                bg_dir, base_data.get("airspaces", []),
+                regions.EG_REGION["bbox"], cycle_display,
+                countries=regions.EG_REGION["countries"])
+            progress.log("airspace: %d openAIP drawing(s)" % added)
+        progress.advance(1.0)
+    else:
+        progress.advance(1.0, "kept")
+
+    # overrides always win
+    overrides_dir = Path(__file__).resolve().parent / "CONFIG"
+    if overrides_dir.is_dir():
+        pack.apply_overrides(stage_dir, overrides_dir, log=None)
+    (nav_dir / "airac.txt").write_text(
+        "region: %s\nairac: %s\nairac_code: %s\nbuilt_utc: %s\ngenerator: %s %s\n"
+        "regenerated: %s\n" % (
+            region, cycle_display, cycle_code,
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            GENERATOR_NAME, __version__, ", ".join(sorted(only))),
+        encoding="utf-8")
+
+    # 6) package -------------------------------------------------------------------
+    progress.step("Packaging the release ZIP", "")
+    counts = {}
+    if manifest_path.is_file():
+        try:
+            counts = dict(json.loads(manifest_path.read_text(encoding="utf-8"))
+                          .get("counts") or {})
+        except ValueError:
+            counts = {}
+    manifest = pack.build_manifest(
+        stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
+        generator=GENERATOR_NAME, generator_version=__version__, counts=counts)
+    pack.write_manifest(stage_dir, manifest)
+    # the seed ZIP's stem decides the output name (2611.zip stays 2611.zip)
+    seed_stem = Path(seed).stem if seed and Path(seed).is_file() \
+        else pack.asset_name(region, cycle_code)
+    zip_path = pack.make_zip(stage_dir, out_dir / ("%s.zip" % seed_stem))
+    problems = pack.verify_zip(zip_path, manifest)
+    if problems:
+        raise RuntimeError("Repackaged ZIP failed verification: %s" % "; ".join(problems))
+    progress.log("packaged %s" % zip_path.name)
+
+    progress.step("Packaging world ZIP (skymaps)", "kept (--only)")
+    progress.advance(1.0)
+    progress.step("Region ZIPs", "kept (--only)")
+    progress.advance(1.0)
+
+    if not args.keep_staging:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
+    # 7) publish ---------------------------------------------------------------------
+    if args.no_publish:
+        progress.step("Publishing to GitHub release", "skipped (--no-publish)")
+        progress.advance(1.0)
+    else:
+        progress.step("Publishing to GitHub release", "checking release")
+        publish([zip_path], cycle_code, cycle_display, progress.log)
+
+    progress.step("Done", "")
+    progress.finish("done")
+    print("Done: regenerated %s for AIRAC %s (%s)"
+          % (", ".join(sorted(only)), cycle_display, cycle_code))
+    return 0
+# Selective regeneration (--only): the individual pieces of CONFIG/nav plus
+# the layout, airspace and eAIP-download steps.
+NAV_ITEMS = ("fixes", "navaids", "airways", "ad-positions", "entry-exit", "ctr")
+ONLY_ITEMS = set(NAV_ITEMS) | {"download", "layouts", "airspace"}
 
 
 # --- Progress display --------------------------------------------------------
@@ -289,6 +513,16 @@ def parse_args(argv=None):
                         help="Publish ONE asset per cycle: <cycle>.zip (e.g. 2611.zip) "
                              "containing everything - the global base merged under the "
                              "SkyHigh data. No world/region ZIPs.")
+    parser.add_argument("--only", default=None,
+                        help="Regenerate only selected parts of an existing navdata, "
+                             "comma-separated from: download, fixes, navaids, airways, "
+                             "ad-positions, entry-exit, ctr, layouts, airspace. "
+                             "Everything else is kept from the seed ZIP (--from-zip, "
+                             "default: the newest ZIP in --out). The base merge always "
+                             "re-runs after any nav regeneration.")
+    parser.add_argument("--from-zip", default=None,
+                        help="Seed the staging tree from this existing navdata ZIP "
+                             "(used with --only). Default: newest ZIP in --out.")
     parser.add_argument("--keep-staging", action="store_true",
                         help="Keep the intermediate staging tree for debugging.")
     parser.add_argument("--out", default="dist")
@@ -305,6 +539,16 @@ def main(argv=None) -> int:
     region = REGION
 
     try:
+        only = None
+        if args.only:
+            only = {s.strip().lower() for s in args.only.split(",") if s.strip()}
+            unknown = only - ONLY_ITEMS
+            if unknown:
+                raise SystemExit("Unknown --only item(s): %s (known: %s)"
+                                 % (", ".join(sorted(unknown)),
+                                    ", ".join(sorted(ONLY_ITEMS))))
+            return run_selective(args, progress, out_dir, only)
+
         # 1) AIRAC source -----------------------------------------------------
         progress.step("Downloading NATS eAIP", "waiting for NATS...")
         def _eaip_progress(done: int, total: int) -> None:
