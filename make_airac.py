@@ -241,7 +241,7 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
             progress_cb=lambda done, total, label:
                 progress.advance(done / max(total, 1), label))
         base_data = dict(openaip)
-        if need_nav_merge or "eaip-bg" in only or "layouts" in only:
+        if need_nav_merge or "eaip-bg" in only or "layouts" in only or "airspace" in only:
             progress.step("OurAirports CSV", "")
             ourairports = base.load_ourairports(Path(args.cache_dir), log=progress.log)
             base_data["ourairports"] = ourairports
@@ -269,6 +269,10 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
                     regions.EG_REGION["bbox"], cycle_display,
                     countries=regions.EG_REGION["countries"])
                 progress.log("airspace: %d EG-scope openAIP drawing(s)" % added)
+            if base_data.get("ourairports"):
+                mapped = regions.write_icao_country_map(
+                    bg_dir, base_data["ourairports"])
+                progress.log("OAIP-countries map: %d ICAO prefix(es)" % mapped)
         progress.advance(1.0)
     else:
         progress.advance(1.0, "kept")

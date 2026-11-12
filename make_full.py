@@ -4,7 +4,7 @@
     python make_full.py
 
 Shows a menu at the start: a full worldwide build (everything in
-``<cycle>.zip``), single-part regeneration (just airways, just navaids, ...),
+``<cycle>.zip``), single-part regeneration (just airspace, just fixes, ...),
 or picking several parts at once. Any ``make_airac.py`` flag still passes
 through for non-interactive use:
 
@@ -21,22 +21,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 MENU = """
 SkyHigh navdata builder - AIRAC {cycle_label}
 ------------------------------------------------------------
- 1) FULL worldwide build + publish
+ 1) Full worldwide fresh AIRAC + publish
       one <cycle>.zip: worldwide airspace, aerodromes, fixes, navaids,
       airways, entry/exit points + worldwide aerodrome layouts
       (layouts hit the X-Plane Gateway for 40k+ aerodromes - allow hours)
- 2) Full build + publish, EG layouts only (much faster)
- 3) Just airways
- 4) Just navaids
- 5) Just fixes
- 6) Just aerodrome positions (AD-positions)
- 7) Just entry/exit points (SIDs/STARs)
- 8) Just CTR positions
- 9) Just aerodrome layouts (e)g, w)orld, or add region prefixes e.g. EG,LF)
-10) Just airspace (worldwide openAIP drawings)
-11) Just eAIP bg drawings (ENR21 + per-aerodrome CTR/ATZ)
- m) Pick multiple parts to regenerate
- p) Change publish behaviour is on the flags; q) Quit
+ 2) Just airspace (skymaps + skyradar)
+ 3) Just fixes
+ 4) Just AD positions
+ 5) Just AD layouts (global - allow hours)
+ 6) Add AD layout region to an existing set
+ 7) Just CTR positions
+ m) Multiple parts
+ q) Quit
 ------------------------------------------------------------
 """
 
@@ -55,8 +51,7 @@ def _prompt_publish(default_yes: bool = True) -> list:
 
 
 def _multi_pick() -> list:
-    items = ("download fixes navaids airways ad-positions entry-exit ctr "
-             "layouts airspace eaip-bg").split()
+    items = ("airspace fixes ad-positions ctr layouts eaip-bg").split()
     print("Available parts: %s" % ", ".join(items))
     raw = input("Parts to regenerate (comma-separated, blank = cancel): ").strip().lower()
     chosen = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
@@ -66,7 +61,14 @@ def _multi_pick() -> list:
         return []
     if not chosen:
         return []
-    return ["--only", ",".join(chosen)]
+    args = ["--only", ",".join(chosen)]
+    if "airspace" in chosen:
+        args += ["--airspace-scope", "world"]
+    if "layouts" in chosen:
+        spec = input("Layout scope - w)orld or comma-separated ICAO region prefixes "
+                     "(e.g. EG,LF) [w]: ").strip()
+        args += ["--layouts", spec or "world"]
+    return args
 
 
 def main_menu() -> list:
@@ -81,25 +83,24 @@ def main_menu() -> list:
             return ["--single", "--airspace-scope", "world", "--layouts", "world", *publish]
         if choice == "2":
             publish = _prompt_publish()
-            return ["--single", "--airspace-scope", "world", *publish]
-        if choice in ("3", "4", "5", "6", "7", "8", "9", "10", "11"):
-            part = {
-                "3": "airways", "4": "navaids", "5": "fixes",
-                "6": "ad-positions", "7": "entry-exit", "8": "ctr",
-                "9": "layouts", "10": "airspace", "11": "eaip-bg",
-            }[choice]
-            scope_args = []
-            if part == "layouts":
-                spec = input(
-                    "Scope - e)g, w)orld, or comma-separated ICAO region prefixes "
-                    "to add/refresh (e.g. EG,LF): ").strip()
-                scope_args = ["--layouts", spec or "eg"]
-            elif part == "airspace":
-                scope = input("Scope - e)g only or w)orld [e]: ").strip().lower()
-                scope_args = ["--airspace-scope",
-                              "world" if scope.startswith("w") else "eg"]
+            return ["--only", "airspace", "--airspace-scope", "world", *publish]
+        if choice in ("3", "4", "7"):
+            part = {"3": "fixes", "4": "ad-positions", "7": "ctr"}[choice]
             publish = _prompt_publish()
-            return ["--only", part, *scope_args, *publish]
+            return ["--only", part, *publish]
+        if choice == "5":
+            print("NOTE: worldwide layouts take hours on the first run "
+                  "(cached afterwards only for the eAIP, not the Gateway).")
+            publish = _prompt_publish()
+            return ["--only", "layouts", "--layouts", "world", *publish]
+        if choice == "6":
+            spec = input("Region prefixes to add/refresh (comma-separated, "
+                         "e.g. EG,LF): ").strip()
+            if not spec:
+                print("No regions given.\n")
+                continue
+            publish = _prompt_publish()
+            return ["--only", "layouts", "--layouts", spec, *publish]
         if choice == "m":
             picked = _multi_pick()
             if picked:
