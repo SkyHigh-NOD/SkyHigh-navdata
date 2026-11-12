@@ -32,8 +32,9 @@ SkyHigh navdata builder - AIRAC {cycle_label}
  6) Just aerodrome positions (AD-positions)
  7) Just entry/exit points (SIDs/STARs)
  8) Just CTR positions
- 9) Just aerodrome layouts
+ 9) Just aerodrome layouts (e)g, w)orld, or add region prefixes e.g. EG,LF)
 10) Just airspace (worldwide openAIP drawings)
+11) Just eAIP bg drawings (ENR21 + per-aerodrome CTR/ATZ)
  m) Pick multiple parts to regenerate
  p) Change publish behaviour is on the flags; q) Quit
 ------------------------------------------------------------
@@ -55,7 +56,7 @@ def _prompt_publish(default_yes: bool = True) -> list:
 
 def _multi_pick() -> list:
     items = ("download fixes navaids airways ad-positions entry-exit ctr "
-             "layouts airspace").split()
+             "layouts airspace eaip-bg").split()
     print("Available parts: %s" % ", ".join(items))
     raw = input("Parts to regenerate (comma-separated, blank = cancel): ").strip().lower()
     chosen = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
@@ -81,17 +82,22 @@ def main_menu() -> list:
         if choice == "2":
             publish = _prompt_publish()
             return ["--single", "--airspace-scope", "world", *publish]
-        if choice in ("3", "4", "5", "6", "7", "8", "9", "10"):
+        if choice in ("3", "4", "5", "6", "7", "8", "9", "10", "11"):
             part = {
                 "3": "airways", "4": "navaids", "5": "fixes",
                 "6": "ad-positions", "7": "entry-exit", "8": "ctr",
-                "9": "layouts", "10": "airspace",
+                "9": "layouts", "10": "airspace", "11": "eaip-bg",
             }[choice]
             scope_args = []
-            if part in ("layouts", "airspace"):
+            if part == "layouts":
+                spec = input(
+                    "Scope - e)g, w)orld, or comma-separated ICAO region prefixes "
+                    "to add/refresh (e.g. EG,LF): ").strip()
+                scope_args = ["--layouts", spec or "eg"]
+            elif part == "airspace":
                 scope = input("Scope - e)g only or w)orld [e]: ").strip().lower()
-                flag = "--layouts" if part == "layouts" else "--airspace-scope"
-                scope_args = [flag, "world" if scope.startswith("w") else "eg"]
+                scope_args = ["--airspace-scope",
+                              "world" if scope.startswith("w") else "eg"]
             publish = _prompt_publish()
             return ["--only", part, *scope_args, *publish]
         if choice == "m":

@@ -233,6 +233,13 @@ def write_world_airspace_groups(bg_dir: Path, airspaces: list, airac_cycle: str)
 
     Returns the total drawing count. Countries with no drawing are skipped.
     """
+    # The per-country layout replaces the older flat EG-scope group entirely;
+    # a stale OAIP.lst would reference a folder that no longer exists.
+    for stale in (bg_dir / "OAIP.lst", bg_dir / "OAIP"):
+        if stale.is_dir():
+            shutil.rmtree(stale, ignore_errors=True)
+        elif stale.exists():
+            stale.unlink()
     by_country: dict = {}
     for airspace in airspaces:
         by_country.setdefault(airspace.get("country") or "XX", []).append(airspace)
@@ -243,6 +250,38 @@ def write_world_airspace_groups(bg_dir: Path, airspaces: list, airac_cycle: str)
             group="OAIP" + country)
         total += added
     return total
+
+
+def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
+    """Write ``CONFIG/bg/OAIP-countries``: one 'ICAO-prefix ISO' per line.
+
+    SkyRadar reads it to pick the ``OAIP<ISO>.lst`` airspace group matching a
+    position's ICAO country prefix (e.g. EG aerodromes -> the GB group). The
+    mapping is a majority vote of the staged aerodromes' countries per prefix.
+    Returns the number of prefixes written.
+    """
+    from collections import Counter
+    by_prefix: dict = {}
+    for icao, record in (ourairports or {}).items():
+        if not isinstance(icao, str) or len(icao) < 4:
+            continue
+        country = str((record or {}).get("country") or "").upper()
+        if not re.match(r"^[A-Z]{2}$", country):
+            continue
+        by_prefix.setdefault(region_prefix(icao), Counter())[country] += 1
+    lines = []
+    for prefix in sorted(by_prefix):
+        iso, _votes = by_prefix[prefix].most_common(1)[0]
+        lines.append("%s %s" % (prefix, iso))
+    if not lines:
+        return 0
+    out = Path(bg_dir) / "OAIP-countries"
+    out.write_text(
+        "# ICAO region prefix -> openAIP ISO country (majority of aerodromes).\n"
+        "# Read by SkyRadar to pick the OAIP<ISO>.lst airspace group for a\n"
+        "# position's country.\n" + "\n".join(lines) + "\n",
+        encoding="utf-8")
+    return len(lines)
 
 
 def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycle: str,

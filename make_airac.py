@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +43,7 @@ from skyhigh_navdata import GENERATOR_NAME, REGION, __version__
 from skyhigh_navdata import aip, base, merge, pack, regions
 from skyhigh_navdata import build as build_navdata
 from skyhigh_navdata.build import build_navdata_from_html
+from skyhigh_navdata.airspace import build_airspace_from_html
 from skyhigh_navdata.cycle import normalize
 
 NAVDATA_REPO = "SkyHigh-NOD/SkyHigh-navdata"
@@ -55,6 +57,7 @@ STEP_PLAN = [
     ("openAIP global exports", 20),
     ("OurAirports CSV", 2),
     ("Merging base + openAIP airspace", 5),
+    ("eAIP CONFIG/bg drawings", 2),
     ("Packaging the release ZIP", 5),
     ("Packaging world ZIP (skymaps)", 5),
     ("Region ZIPs", 8),
@@ -64,12 +67,65 @@ STEP_PLAN = [
 
 # Selective regeneration (--only): the individual pieces of CONFIG/nav plus
 # the layout, airspace and eAIP-download steps.
+def _ad_positions_icaos(positions_path: Path) -> list:
+    """All aerodrome ICAOs from a CONFIG/nav/AD-positions file."""
+    return [line.split()[0].upper()
+            for line in positions_path.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+            if line.strip() and line.split()[0][:1].isalpha()]
+
+
+def _parse_layout_regions(spec: str) -> list:
+    """Validate a comma-separated ICAO region prefix list (e.g. 'EG,LF,K')."""
+    prefixes = [part.strip().upper() for part in (spec or "").split(",")]
+    prefixes = [prefix for prefix in prefixes if prefix]
+    if not prefixes:
+        raise ValueError("--layouts region list is empty.")
+    for prefix in prefixes:
+        if not re.match(r"^[A-Z]{1,2}$", prefix):
+            raise ValueError("Bad ICAO region prefix in --layouts: %r" % prefix)
+    return prefixes
+
+
+def _layout_icaos(spec: str, positions_path: Path, eaip_icaos: list) -> list:
+    """Aerodrome ICAO list for a layout spec: 'eg' (the eAIP aerodromes),
+    'world' (every aerodrome in the merged base) or a comma-separated list of
+    ICAO region prefixes to add to / refresh in an existing set (e.g.
+    'EG,LF' or 'ED')."""
+    spec = (spec or "eg").strip().lower()
+    if spec == "eg":
+        pool = list(eaip_icaos or [])
+        if not pool:
+            pool = _ad_positions_icaos(positions_path)
+        return [icao for icao in pool if regions.region_prefix(icao) == "EG"]
+    if spec == "world":
+        return _ad_positions_icaos(positions_path)
+    prefixes = set(_parse_layout_regions(spec))
+    return [icao for icao in _ad_positions_icaos(positions_path)
+            if regions.region_prefix(icao) in prefixes]
+
+
 def _zip_cycle(zip_path: Path) -> tuple[str, str]:
     """(airac_code, airac_display) from a built navdata ZIP's manifest."""
     with zipfile.ZipFile(zip_path) as archive:
         manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
     return (str(manifest.get("airac_code") or ""),
             str(manifest.get("airac") or ""))
+
+
+def _clean_eaip_bg(bg_dir: Path) -> None:
+    """Remove previously generated eAIP CONFIG/bg drawings (ENR 2.1 group and
+    per-aerodrome CTR/ATZ lists) so regeneration starts from a clean slate."""
+    for name in ("ENR21.lst", "ENR21.sectors"):
+        (bg_dir / name).unlink(missing_ok=True)
+    group_dir = bg_dir / "ENR21"
+    if group_dir.is_dir():
+        shutil.rmtree(group_dir, ignore_errors=True)
+    for lst in bg_dir.glob("EG*.lst"):
+        lst.unlink()
+        ad_dir = bg_dir / lst.stem
+        if ad_dir.is_dir():
+            shutil.rmtree(ad_dir, ignore_errors=True)
 
 
 def run_selective(args, progress, out_dir: Path, only: set) -> int:
@@ -165,48 +221,17 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     else:
         progress.advance(1.0, "kept")
 
-    # 4) layouts ------------------------------------------------------------------
-    progress.step("X-Plane Gateway airport layouts", "")
-    if "layouts" in only:
-        layout_scope = getattr(args, "layouts", "eg")
-        if layout_scope == "world":
-            positions_path = nav_dir / "AD-positions"
-            icaos = [line.split()[0].upper()
-                     for line in positions_path.read_text(
-                         encoding="utf-8", errors="replace").splitlines()
-                     if line.strip() and line.split()[0][:1].isalpha()]
-            progress.log("worldwide layouts: %d aerodrome(s) requested" % len(icaos))
-        elif not icaos:
-            positions_path = nav_dir / "AD-positions"
-            if positions_path.is_file():
-                icaos = [line.split()[0].upper()
-                         for line in positions_path.read_text(
-                             encoding="utf-8", errors="replace").splitlines()
-                         if line.strip() and line.split()[0][:1].isalpha()]
-        ad_dir = stage_dir / "CONFIG" / "ad"
-        custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
-        summary = aip.download_all_ad_layouts(
-            icaos, ad_dir, log=None, skip=custom_icaos,
-            progress_cb=lambda done, total, icao:
-                progress.advance(done / max(total, 1),
-                                 "%s (%d/%d)" % (icao, done, total)))
-        progress.log("layouts: %d downloaded, %d failed"
-                     % (summary["downloaded"], summary["failed"]))
-        progress.advance(1.0)
-    else:
-        progress.advance(1.0, "kept")
-
     # 5) base data + merge ---------------------------------------------------------
     base_data = None
     need_nav_merge = bool(nav_wanted)
-    if "airspace" in only or need_nav_merge:
+    if "airspace" in only or "eaip-bg" in only or "layouts" in only or need_nav_merge:
         progress.step("openAIP global exports", "listing")
         openaip = base.load_openaip(
             Path(args.cache_dir), log=None,
             progress_cb=lambda done, total, label:
                 progress.advance(done / max(total, 1), label))
         base_data = dict(openaip)
-        if need_nav_merge:
+        if need_nav_merge or "eaip-bg" in only or "layouts" in only:
             progress.step("OurAirports CSV", "")
             ourairports = base.load_ourairports(Path(args.cache_dir), log=progress.log)
             base_data["ourairports"] = ourairports
@@ -238,6 +263,52 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     else:
         progress.advance(1.0, "kept")
 
+    # 4b) airport layouts — after the merge, so a region list resolves against
+    # the merged worldwide aerodrome list (this is how a region is *added* to
+    # an already-built set: its layouts download on top of the seeded ones).
+    progress.step("X-Plane Gateway airport layouts", "")
+    if "layouts" in only:
+        layout_spec = getattr(args, "layouts", "eg")
+        positions_path = nav_dir / "AD-positions"
+        icaos = _layout_icaos(layout_spec, positions_path, icaos)
+        progress.log("layouts %s: %d aerodrome(s) requested" % (layout_spec, len(icaos)))
+        ad_dir = stage_dir / "CONFIG" / "ad"
+        custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
+        summary = aip.download_all_ad_layouts(
+            icaos, ad_dir, log=None, skip=custom_icaos,
+            progress_cb=lambda done, total, icao:
+                progress.advance(done / max(total, 1),
+                                 "%s (%d/%d)" % (icao, done, total)))
+        progress.log("layouts: %d downloaded, %d failed"
+                     % (summary["downloaded"], summary["failed"]))
+        progress.advance(1.0)
+    else:
+        progress.advance(1.0, "kept")
+
+    # 5b) eAIP CONFIG/bg drawings: the ENR 2.1 sector group plus one .lst per
+    # EG aerodrome (CTR/ATZ) — the EG-specific background files SkyRadar
+    # layers under an aerodrome's own drawing.
+    progress.step("eAIP CONFIG/bg drawings", "")
+    eaip_counts = None
+    if "eaip-bg" in only:
+        if not html_dir.is_dir():
+            progress.finish("FAILED")
+            print("eAIP HTML is not cached (dist/airac/html). Add 'download' to --only.",
+                  file=sys.stderr)
+            return 1
+        bg_dir = stage_dir / "CONFIG" / "bg"
+        _clean_eaip_bg(bg_dir)
+        eaip_counts = build_airspace_from_html(
+            html_dir, bg_dir, region, cycle_display, log=None)
+        progress.log("eAIP bg: ENR 2.1 %d drawing(s), %d per-aerodrome drawing(s)"
+                     % (eaip_counts["enr_airspace"], eaip_counts["ad_airspace"]))
+        if base_data and base_data.get("ourairports"):
+            mapped = regions.write_icao_country_map(bg_dir, base_data["ourairports"])
+            progress.log("OAIP-countries map: %d ICAO prefix(es)" % mapped)
+        progress.advance(1.0)
+    else:
+        progress.advance(1.0, "kept")
+
     # overrides always win
     overrides_dir = Path(__file__).resolve().parent / "CONFIG"
     if overrides_dir.is_dir():
@@ -259,6 +330,14 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
                           .get("counts") or {})
         except ValueError:
             counts = {}
+    if eaip_counts:
+        counts.update(eaip_counts)
+    if "layouts" in only:
+        # the set may have grown (a region was added); count the actual
+        # layout files so the manifest matches the ZIP
+        ad_count = sum(1 for path in (stage_dir / "CONFIG" / "ad").glob("*.dat"))
+        counts["layouts"] = max(
+            0, ad_count - (counts.get("layouts_custom") or 0))
     manifest = pack.build_manifest(
         stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
         generator=GENERATOR_NAME, generator_version=__version__, counts=counts)
@@ -296,7 +375,7 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
 # Selective regeneration (--only): the individual pieces of CONFIG/nav plus
 # the layout, airspace and eAIP-download steps.
 NAV_ITEMS = ("fixes", "navaids", "airways", "ad-positions", "entry-exit", "ctr")
-ONLY_ITEMS = set(NAV_ITEMS) | {"download", "layouts", "airspace"}
+ONLY_ITEMS = set(NAV_ITEMS) | {"download", "layouts", "airspace", "eaip-bg"}
 
 
 # --- Progress display --------------------------------------------------------
@@ -524,10 +603,12 @@ def parse_args(argv=None):
                         help="Airspace drawings scope: 'eg' (UK+Ireland, the combined "
                              "build) or 'world' (every openAIP country, bucketed into "
                              "per-country .lst groups). Default: %(default)s.")
-    parser.add_argument("--layouts", choices=("eg", "world"), default="eg",
+    parser.add_argument("--layouts", default="eg",
                         help="Aerodrome layout scope: 'eg' (the eAIP aerodromes, "
-                             "~116 layouts) or 'world' (every aerodrome in the merged "
-                             "navdata — 40k+ Gateway requests, hours). "
+                             "~116 layouts), 'world' (every aerodrome in the merged "
+                             "navdata - 40k+ Gateway requests, hours) or a "
+                             "comma-separated list of ICAO region prefixes to add/"
+                             "refresh on top of an existing set (e.g. EG,LF or ED). "
                              "Default: %(default)s.")
     parser.add_argument("--no-publish", action="store_true",
                         help="Build only; do not create/upload the GitHub release.")
@@ -538,7 +619,8 @@ def parse_args(argv=None):
     parser.add_argument("--only", default=None,
                         help="Regenerate only selected parts of an existing navdata, "
                              "comma-separated from: download, fixes, navaids, airways, "
-                             "ad-positions, entry-exit, ctr, layouts, airspace. "
+                             "ad-positions, entry-exit, ctr, layouts, airspace, eaip-bg "
+                             "(eAIP ENR21 + per-aerodrome CTR/ATZ bg drawings). "
                              "Everything else is kept from the seed ZIP (--from-zip, "
                              "default: the newest ZIP in --out). The base merge always "
                              "re-runs after any nav regeneration.")
@@ -549,7 +631,13 @@ def parse_args(argv=None):
                         help="Keep the intermediate staging tree for debugging.")
     parser.add_argument("--out", default="dist")
     parser.add_argument("--cache-dir", default=".cache")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.layouts not in ("eg", "world"):
+        try:
+            _parse_layout_regions(args.layouts)
+        except ValueError as error:
+            parser.error(str(error))
+    return args
 
 
 def main(argv=None) -> int:
@@ -638,22 +726,40 @@ def main(argv=None) -> int:
                 progress.log("airspace: %d EG-scope openAIP drawing(s)" % added)
             counts["airspace_drawings"] = added
 
+        # 4b) eAIP CONFIG/bg drawings -------------------------------------------
+        # The ENR 2.1 sector group plus one .lst per EG aerodrome (CTR/ATZ).
+        # These are the EG-specific background files SkyRadar layers under an
+        # aerodrome's own drawing, so they ship inside the single ZIP too —
+        # and SkyRadar additionally auto-loads the aerodrome's FIR-country
+        # openAIP group (CONFIG/bg/OAIP-countries maps ICAO prefix -> group).
+        progress.step("eAIP CONFIG/bg drawings", "")
+        if base_data and base_data.get("ourairports"):
+            mapped = regions.write_icao_country_map(bg_dir, base_data["ourairports"])
+            progress.log("OAIP-countries map: %d ICAO prefix(es)" % mapped)
+        if html_dir.is_dir():
+            eaip_bg = build_airspace_from_html(
+                html_dir, bg_dir, region, cycle_display, log=None)
+            counts.update(eaip_bg)
+            progress.log("eAIP bg: ENR 2.1 %d drawing(s), %d per-aerodrome drawing(s)"
+                         % (eaip_bg["enr_airspace"], eaip_bg["ad_airspace"]))
+            progress.advance(1.0)
+        else:
+            progress.advance(1.0, "eAIP HTML not cached")
+
         # 5) airport layouts ----------------------------------------------------
         progress.step("X-Plane Gateway airport layouts", "")
         if args.skip_layouts:
             progress.advance(1.0, "skipped")
             counts["layouts"] = 0
         else:
+            positions = stage_dir / "CONFIG" / "nav" / "AD-positions"
+            icaos = _layout_icaos(args.layouts, positions, icaos)
             if args.layouts == "world":
-                # every aerodrome in the merged worldwide list; the Gateway
-                # 404s the ones it does not know, so expect a large
-                # 'unavailable' count and a multi-hour run
-                positions = stage_dir / "CONFIG" / "nav" / "AD-positions"
-                icaos = [line.split()[0].upper()
-                         for line in positions.read_text(
-                             encoding="utf-8", errors="replace").splitlines()
-                         if line.strip() and line.split()[0][:1].isalpha()]
+                # the Gateway 404s aerodromes it does not know, so expect a
+                # large 'unavailable' count and a multi-hour run
                 progress.log("worldwide layouts: %d aerodrome(s) requested" % len(icaos))
+            else:
+                progress.log("layouts %s: %d aerodrome(s) requested" % (args.layouts, len(icaos)))
             custom_icaos = pack.custom_ad_icaos(Path(__file__).resolve().parent / "CONFIG")
             summary = aip.download_all_ad_layouts(
                 icaos, ad_dir, log=None, skip=custom_icaos,
