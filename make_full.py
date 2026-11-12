@@ -51,7 +51,7 @@ def _prompt_publish(default_yes: bool = True) -> list:
 
 
 def _multi_pick() -> list:
-    items = ("airspace fixes ad-positions ctr layouts eaip-bg").split()
+    items = ("airspace fixes ad-positions ctr layouts").split()
     print("Available parts: %s" % ", ".join(items))
     raw = input("Parts to regenerate (comma-separated, blank = cancel): ").strip().lower()
     chosen = [p.strip() for p in raw.replace(" ", ",").split(",") if p.strip()]
@@ -82,6 +82,8 @@ def main_menu() -> list:
             publish = _prompt_publish()
             return ["--single", "--airspace-scope", "world", "--layouts", "world", *publish]
         if choice == "2":
+            # world-scope per-country groups (skymaps + skyradar) and the
+            # OAIP-countries map skyradar uses to pick a position's group
             publish = _prompt_publish()
             return ["--only", "airspace", "--airspace-scope", "world", *publish]
         if choice in ("3", "4", "7"):
