@@ -34,8 +34,31 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def merge_fixes(nav_dir: Path, base: dict, log=None) -> int:
-    """Append openAIP reporting points to fix.dat (plain lat lon name rows)."""
+def _fallback_fix_rows() -> list[str]:
+    """Worldwide fixes from the bundled X-Plane earth-fix.dat (Robin A. Peel's
+    navdata, GPL v2+ — the header inside states the licence). This is the
+    lowest-precedence layer under the eAIP fixes and openAIP reporting points,
+    which alone cover mostly Europe."""
+    path = Path(__file__).resolve().parent / "resources" / "earth-fix.dat"
+    rows = []
+    try:
+        for line in path.read_text(encoding="ascii", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and re.match(r"^-?\d+(?:\.\d+)?$", parts[0]) \
+                    and re.match(r"^-?\d+(?:\.\d+)?$", parts[1]):
+                rows.append(line.strip())
+    except OSError:
+        pass
+    return rows
+
+
+def merge_fixes(nav_dir: Path, base: dict, log=None) -> tuple[int, int]:
+    """Append base fixes to fix.dat (plain lat lon name rows).
+
+    Precedence is insertion order: the eAIP fixes are already in the file, so
+    openAIP reporting points are appended first and the bundled worldwide
+    X-Plane fix set last — names already present are never duplicated.
+    Returns (openaip_added, fallback_added)."""
     existing = set()
     lines = _read_lines(Path(nav_dir) / "fix.dat")
     for line in lines:
@@ -48,14 +71,24 @@ def merge_fixes(nav_dir: Path, base: dict, log=None) -> int:
             continue
         existing.add(name)
         added.append("%.6f %.6f %s" % (lat, lon, name))
+    openaip_added = len(added)
+    fallback_added = 0
+    for row in _fallback_fix_rows():
+        parts = row.split()
+        if parts[2].upper() in existing:
+            continue
+        existing.add(parts[2].upper())
+        added.append(row)
+        fallback_added += 1
     if added:
         _atomic_write_text(
             Path(nav_dir) / "fix.dat",
             "\n".join(lines + added) + "\n",
         )
     if log:
-        log("fixes: +%d openAIP reporting point(s)" % len(added))
-    return len(added)
+        log("fixes: +%d openAIP reporting point(s), +%d worldwide fallback"
+            % (openaip_added, fallback_added))
+    return openaip_added, fallback_added
 
 
 def merge_navaids(nav_dir: Path, base: dict, log=None) -> int:
@@ -131,8 +164,10 @@ def merge_aerodromes(nav_dir: Path, base: dict, log=None) -> int:
 def merge_base_into_stage(stage_dir: Path, base: dict, log=None) -> dict:
     """Apply all base merges to a staged CONFIG tree. Returns counts."""
     nav_dir = Path(stage_dir) / "CONFIG" / "nav"
+    openaip_fixes, fallback_fixes = merge_fixes(nav_dir, base, log)
     counts = {
-        "base_fixes": merge_fixes(nav_dir, base, log),
+        "base_fixes": openaip_fixes,
+        "base_fallback_fixes": fallback_fixes,
         "base_navaids": merge_navaids(nav_dir, base, log),
         "base_aerodromes": merge_aerodromes(nav_dir, base, log),
     }
