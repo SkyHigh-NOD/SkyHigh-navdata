@@ -24,14 +24,33 @@ def request_url(url: str) -> Request:
     return Request(url, headers={"User-Agent": USER_AGENT})
 
 
-def download_file(url: str, destination: Path, timeout: int = 120) -> None:
+def download_file(url: str, destination: Path, timeout: int = 120,
+                  progress_cb=None) -> None:
+    """Stream a URL to disk. ``progress_cb(bytes_done, bytes_total)`` fires per
+    chunk when supplied. When the server omits Content-Length on the GET, a
+    HEAD request fills the gap; 0 means genuinely unknown."""
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(request_url(url), timeout=timeout) as response, destination.open("wb") as output:
+        total_header = response.headers.get("Content-Length")
+        total = int(total_header) if total_header and total_header.isdigit() else 0
+        if not total:
+            try:
+                with urlopen(Request(url, headers={"User-Agent": USER_AGENT},
+                                     method="HEAD"), timeout=30) as head:
+                    head_length = head.headers.get("Content-Length")
+                    if head_length and head_length.isdigit():
+                        total = int(head_length)
+            except OSError:
+                pass
+        done = 0
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(512 * 1024)
             if not chunk:
                 break
             output.write(chunk)
+            done += len(chunk)
+            if progress_cb:
+                progress_cb(done, total)
 
 
 # --- NATS UK eAIP -----------------------------------------------------------
@@ -47,8 +66,11 @@ def find_current_nats_airac():
     return "%s/%s" % (cycle.group(1), cycle.group(2)[-2:]), urljoin(NATS_AIP_URL, archive.group(1))
 
 
-def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
-    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir)."""
+def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tuple[str, Path]:
+    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir).
+
+    ``progress_cb(bytes_done, bytes_total)`` tracks the download when supplied.
+    """
     cycle, zip_url = find_current_nats_airac()
     if log:
         log("Detected AIRAC cycle: %s" % cycle)
@@ -57,7 +79,23 @@ def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     html_dir = dest_dir / "html"
     archive_path = dest_dir / "nats-airac.zip"
-    download_file(zip_url, archive_path)
+
+    # A previous run may already have pulled the (very large) archive down;
+    # a complete ZIP's central directory lives at the end of the file, so a
+    # truncated download fails this check and gets re-downloaded.
+    if archive_path.is_file() and archive_path.stat().st_size > 10_000_000:
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                archive.namelist()
+            if log:
+                log("Found the existing NATS ZIP (%.0f MB) - reusing it, no download."
+                    % (archive_path.stat().st_size / 1e6))
+        except (zipfile.BadZipFile, OSError):
+            if log:
+                log("Existing NATS ZIP is incomplete - re-downloading.")
+            archive_path.unlink()
+    if not archive_path.is_file():
+        download_file(zip_url, archive_path, progress_cb=progress_cb)
     if html_dir.exists():
         shutil.rmtree(html_dir)
     html_dir.mkdir(parents=True, exist_ok=True)
@@ -176,37 +214,41 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
     return True
 
 
-def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None) -> dict:
+def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None, progress_cb=None) -> dict:
     """Download one apt.dat per aerodrome into ``ad_dir``. Returns a counts summary.
 
     ``skip`` is an optional collection of ICAOs that already have a local
     override; those are left for the caller to supply instead of downloading.
+    ``progress_cb(done, total, icao)`` is called per aerodrome when supplied.
     """
     ad_dir = Path(ad_dir)
     ad_dir.mkdir(parents=True, exist_ok=True)
     skip = {code.upper() for code in skip} if skip else set()
     downloaded = unavailable = failed = custom = 0
     layouts = []
+    total = len(icaos)
     for index, icao in enumerate(icaos, start=1):
         if icao.upper() in skip:
             custom += 1
             if log:
-                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, len(icaos), icao))
-            continue
-        output = ad_dir / (icao.upper() + ".dat")
-        if log:
-            log("[%d/%d] X-Plane Gateway layout: %s" % (index, len(icaos), icao))
-        try:
-            if write_gateway_layout(icao, output, log):
-                downloaded += 1
-                layouts.append(icao.upper())
-            else:
-                unavailable += 1
-        except Exception as error:  # noqa: BLE001 - keep going on individual failures
-            failed += 1
+                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, total, icao))
+        else:
+            output = ad_dir / (icao.upper() + ".dat")
             if log:
-                log("Failed to download %s layout: %s" % (icao, error))
-        time.sleep(0.25)
+                log("[%d/%d] X-Plane Gateway layout: %s" % (index, total, icao))
+            try:
+                if write_gateway_layout(icao, output, log):
+                    downloaded += 1
+                    layouts.append(icao.upper())
+                else:
+                    unavailable += 1
+            except Exception as error:  # noqa: BLE001 - keep going on individual failures
+                failed += 1
+                if log:
+                    log("Failed to download %s layout: %s" % (icao, error))
+            time.sleep(0.25)
+        if progress_cb:
+            progress_cb(index, total, icao)
     if log:
         log("Airport layouts complete: %d downloaded, %d overridden, %d unavailable, %d failed."
             % (downloaded, custom, unavailable, failed))

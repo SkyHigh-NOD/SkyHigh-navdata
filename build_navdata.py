@@ -21,12 +21,13 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
+import urllib.error
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from skyhigh_navdata import GENERATOR_NAME, REGION, __version__
-from skyhigh_navdata import aip, pack
+from skyhigh_navdata import aip, GENERATOR_NAME, REGION, __version__
+from skyhigh_navdata import base, merge, pack, regions
 from skyhigh_navdata.airspace import build_airspace_from_html
 from skyhigh_navdata.build import build_navdata_from_html
 from skyhigh_navdata.cycle import CycleError, normalize
@@ -62,7 +63,25 @@ def parse_args(argv=None):
     parser.add_argument("--skip-layouts", action="store_true",
                         help="Skip the X-Plane Gateway airport layouts (CONFIG/ad).")
     parser.add_argument("--skip-airspace", action="store_true",
-                        help="Skip the ENR 2.1 / AD 2.17 airspace drawings (CONFIG/bg).")
+                        help="Skip the airspace drawings (CONFIG/bg) entirely.")
+    parser.add_argument("--airspace-source", choices=("openaip", "eaip"), default="openaip",
+                        help="Airspace drawing source. openAIP replaces the (currently "
+                             "broken) eAIP-generated airspace; 'eaip' restores the old "
+                             "NATS eAIP ENR 2.1 / AD 2.17 parser. Default: %(default)s. "
+                             "Requires --no-base to be off for 'openaip'.")
+    parser.add_argument("--no-base", action="store_true",
+                        help="Do not merge the global base data (openAIP + OurAirports) "
+                             "under the SkyHigh data.")
+    parser.add_argument("--regions", default=None,
+                        help="Which per-region ZIPs to also build: 'auto' (default) "
+                             "derives every ICAO region prefix from the staged "
+                             "aerodromes, a comma list builds exactly those (e.g. "
+                             "'LF,ED,K'), and 'none' builds none of them.")
+    parser.add_argument("--min-region-airports", type=int, default=10,
+                        help="With --regions auto, only build regions with at least "
+                             "this many aerodromes. Default: %(default)s")
+    parser.add_argument("--cache-dir", default=".cache",
+                        help="Where base-data downloads are cached. Default: %(default)s")
     parser.add_argument("--overrides-dir", default=None,
                         help="CONFIG folder of hand-maintained files that override generated "
                              "ones. Default: the repository's CONFIG/ folder.")
@@ -169,9 +188,44 @@ def main(argv=None) -> int:
     icaos = result["icaos"]
 
     sources = {"aip": "NATS UK eAIP (https://nats-uk.ead-it.com)"}
+
+    # Global base data loads before the airspace step: when openAIP provides
+    # the airspace drawings (the eAIP-generated ones are currently broken),
+    # they come straight from the freshly loaded exports.
+    base_data = None
+    if not args.no_base:
+        log("Loading global base data (openAIP + OurAirports) ...")
+        try:
+            ourairports = base.load_ourairports(Path(args.cache_dir), log=log)
+            openaip = base.load_openaip(Path(args.cache_dir), log=log)
+            base_data = dict(openaip)
+            base_data["ourairports"] = ourairports
+            counts.update(ourairports.get("counts", {}))
+            counts.update(openaip.get("counts", {}))
+            sources["base"] = ("openAIP daily exports (https://storage.openaip.net) and "
+                               "OurAirports (https://ourairports-data.github.io) — global "
+                               "base under the SkyHigh data")
+        except (urllib.error.URLError, OSError) as error:
+            log("WARNING: base data unavailable (%s); building SkyHigh data only." % error)
+            base_data = None
+
     if args.skip_airspace:
         log("Skipping airspace drawings (--skip-airspace).")
         sources["airspace"] = "skipped"
+    elif args.airspace_source == "openaip":
+        if not base_data:
+            log("WARNING: no openAIP data loaded (--no-base or fetch failed); "
+                "CONFIG/bg will have no airspace drawings.")
+            sources["airspace"] = "unavailable (no openAIP data)"
+        else:
+            log("Building airspace drawings from openAIP exports "
+                "(replacing the broken eAIP airspace) ...")
+            added, _group = regions.write_openaip_airspace_group(
+                bg_dir, base_data.get("airspaces", []),
+                regions.EG_REGION["bbox"], cycle_display,
+                countries=regions.EG_REGION["countries"])
+            counts["airspace_drawings"] = added
+            sources["airspace"] = "openAIP daily exports (replaces eAIP airspace)"
     else:
         log("Building airspace drawings into CONFIG/bg ...")
         counts.update(build_airspace_from_html(html_dir, bg_dir, region, cycle_display, log=log))
@@ -206,6 +260,12 @@ def main(argv=None) -> int:
     else:
         sources["overrides"] = "none"
 
+    # Global base data merges underneath the SkyHigh files: the eAIP-generated
+    # entries already sit in the nav files, so the merge only ever appends
+    # identities the build has not produced — SkyHigh > openAIP > OurAirports.
+    if base_data:
+        counts.update(merge.merge_base_into_stage(stage_dir, base_data, log=log))
+
     (nav_dir / "airac.txt").write_text(
         "region: %s\nairac: %s\nairac_code: %s\nbuilt_utc: %s\ngenerator: %s %s\n" % (
             region, cycle_display, cycle_code,
@@ -238,6 +298,26 @@ def main(argv=None) -> int:
             "antivirus scanner). Add the build folder to your antivirus exclusions, then "
             "rebuild." % ("\n  - ".join(problems), stage_dir))
 
+    # The world ZIP for skymaps (the fully merged tree, re-manifested as
+    # region ALL), then per-region subsets. The combined ZIP is built and
+    # verified above, so its manifest is already sealed.
+    world_zip = None
+    region_zips = []
+    if not args.no_base:
+        world_zip = regions.build_global_zip(
+            stage_dir, out_dir, cycle_display, cycle_code,
+            generator_version=__version__, log=log)
+    region_spec = (args.regions or "").strip().lower()
+    if region_spec != "none":
+        for prefix in regions.resolve_regions(args.regions, stage_dir, args.min_region_airports):
+            region_zips.append(regions.build_region_zip(
+                prefix, stage_dir, out_dir,
+                cycle_display, cycle_code,
+                base_airspaces=(base_data or {}).get("airspaces"),
+                generator_version=__version__,
+                log=log,
+            ))
+
     if not args.keep_staging:
         shutil.rmtree(stage_dir, ignore_errors=True)
 
@@ -252,6 +332,11 @@ def main(argv=None) -> int:
     print("  AIRAC cycle : %s (%s)" % (cycle_display, cycle_code), flush=True)
     print("  Files       : %d (%.2f MB)" % (len(manifest["files"]), size_mb), flush=True)
     print("  Counts      : %s" % ", ".join("%s=%s" % item for item in sorted(counts.items())), flush=True)
+    if world_zip:
+        print("  World ZIP   : %s" % world_zip.name, flush=True)
+    for region_zip in region_zips:
+        if region_zip:
+            print("  Region ZIP  : %s" % region_zip.name, flush=True)
     if notes_path:
         print("  Notes       : %s" % notes_path, flush=True)
     print("", flush=True)
