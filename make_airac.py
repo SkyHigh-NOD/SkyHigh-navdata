@@ -151,16 +151,22 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
                       if p.stat().st_size > 100_000]
         if candidates:
             seed = str(max(candidates, key=lambda p: p.stat().st_mtime))
-    if not (stage_dir / "CONFIG").exists():
+    manifest_path = stage_dir / "manifest.json"
+    if not (stage_dir / "CONFIG").exists() or not manifest_path.is_file():
         if not seed or not Path(seed).is_file():
             progress.finish("FAILED")
             print("No staging tree and no seed ZIP found. Run the full build once, "
                   "or pass --from-zip <path>.", file=sys.stderr)
             return 1
+        if (stage_dir / "CONFIG").exists():
+            # a leftover staging tree without a manifest is unusable — the
+            # release ZIP is the source of truth, so start over from it
+            progress.log("Staging tree has no manifest.json - re-seeding from %s"
+                         % Path(seed).name)
+            shutil.rmtree(stage_dir, ignore_errors=True)
         progress.log("Seeding staging from %s" % seed)
         with zipfile.ZipFile(seed) as archive:
             archive.extractall(stage_dir)
-    manifest_path = stage_dir / "manifest.json"
     if manifest_path.is_file():
         try:
             seed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
