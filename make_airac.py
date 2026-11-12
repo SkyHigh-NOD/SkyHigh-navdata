@@ -126,6 +126,10 @@ def _clean_eaip_bg(bg_dir: Path) -> None:
         ad_dir = bg_dir / lst.stem
         if ad_dir.is_dir():
             shutil.rmtree(ad_dir, ignore_errors=True)
+    # a leftover flat OAIP group references a folder the world layout no
+    # longer ships; drop it when per-country groups are present
+    if any(bg_dir.glob("OAIP?*.lst")) and not (bg_dir / "OAIP").is_dir():
+        (bg_dir / "OAIP.lst").unlink(missing_ok=True)
 
 
 def run_selective(args, progress, out_dir: Path, only: set) -> int:
