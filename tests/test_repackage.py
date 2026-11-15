@@ -14,12 +14,15 @@ PARIS = [(48.6, 2.1), (48.6, 2.9), (49.4, 2.9), (48.6, 2.1)]
 ORLY = [(48.6, 2.2), (48.6, 2.5), (48.9, 2.5), (48.6, 2.2)]
 
 
-def seed_zip(tmp_path, positions, counts=None, region="EG", overrides=None):
+BOTH = "%s, and %s" % (regions.EAIP_AIRSPACE, regions.OPENAIP_AIRSPACE)
+
+
+def seed_zip(tmp_path, positions, counts=None, region="EG", overrides=None, airspace=None):
     path = tmp_path / "seed" / "EG_2611.zip"
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest = {"region": region, "airac": "11/26", "airac_code": "2611",
                 "counts": counts or {}, "overrides": overrides or [],
-                "sources": {"aip": "NATS UK eAIP", "airspace": "NATS UK eAIP ENR 2.1 / AD 2.17"}}
+                "sources": {"aip": "NATS UK eAIP", "airspace": airspace or regions.EAIP_AIRSPACE}}
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("manifest.json", json.dumps(manifest))
         archive.writestr("CONFIG/nav/AD-positions", "\n".join(positions + [str(len(positions))]) + "\n")
@@ -120,7 +123,8 @@ def test_keep_packages_the_published_drawings_in_the_regions(tmp_path, monkeypat
     assert manifest["counts"]["openaip_airspaces"] == 1
     world, world_manifest = read_zip(out / "ALL_2611.zip")
     assert world["CONFIG/bg/OAIPFR/PARIS-CTR.draw"] == PUBLISHED_DRAW
-    assert world_manifest["sources"]["airspace"] == "NATS UK eAIP ENR 2.1 / AD 2.17"
+    assert world_manifest["sources"]["airspace"] == BOTH
+    assert manifest["sources"]["airspace"] == regions.OPENAIP_AIRSPACE
 
 
 def test_openaip_redraws_the_groups_and_keeps_the_eaip_drawings(tmp_path, monkeypatch):
@@ -147,10 +151,12 @@ def test_a_failed_base_load_repackages_nothing(tmp_path, monkeypatch):
     assert list(out.iterdir()) == []
 
 
-def test_a_region_zip_is_not_repackaged_as_the_combined_one(tmp_path, monkeypatch):
+def test_a_region_zip_is_not_repackaged_as_the_combined_one(tmp_path, monkeypatch, capsys):
     fresh_sources(monkeypatch)
-    with pytest.raises(SystemExit, match="LF package"):
-        run(tmp_path, seed_zip(tmp_path, SEEDED, region="LF"))
+    code, out = run(tmp_path, seed_zip(tmp_path, SEEDED, region="LF"))
+    assert code == 1
+    assert "LF package" in capsys.readouterr().err
+    assert list(out.iterdir()) == []
 
 
 def staged(tmp_path, positions, navaids=("2 51.487000 -0.467000 80 113.60 0 0 LON 0 EG London",
@@ -213,3 +219,90 @@ def test_staged_drawings_are_copied_by_position_not_redrawn(tmp_path):
     assert (region_bg / "OAIPFR" / "PARIS-CTR.draw").read_text(encoding="utf-8") == PUBLISHED_DRAW
     assert regions.copy_staged_airspace_groups(stage_bg, tmp_path / "far", (0.0, 100.0, 1.0, 101.0)) == 0
     assert not (tmp_path / "far").exists()
+
+
+@pytest.mark.parametrize("seeded_label", [None, BOTH, "openAIP daily exports (CC BY-NC 4.0)", "skipped"])
+def test_the_nats_credit_stays_while_eaip_drawings_are_in_the_package(tmp_path, monkeypatch, seeded_label):
+    fresh_sources(monkeypatch)
+    code, out = run(tmp_path, seed_zip(tmp_path, SEEDED, airspace=seeded_label),
+                    "--airspace-source", "openaip")
+    assert code == 0
+    world, manifest = read_zip(out / "ALL_2611.zip")
+    assert "CONFIG/bg/ENR21.lst" in world and "CONFIG/bg/OAIPFR.lst" in world
+    assert manifest["sources"]["airspace"] == BOTH
+
+
+def test_the_airspace_label_names_what_the_tree_holds(tmp_path):
+    assert regions.airspace_label(tmp_path / "missing") == "none in this package"
+    (tmp_path / "OAIPFR.lst").write_text("x", encoding="utf-8")
+    assert regions.airspace_label(tmp_path) == regions.OPENAIP_AIRSPACE
+    (tmp_path / "EGLL.lst").write_text("x", encoding="utf-8")
+    assert regions.airspace_label(tmp_path) == BOTH
+    (tmp_path / "OAIPFR.lst").unlink()
+    assert regions.airspace_label(tmp_path) == regions.EAIP_AIRSPACE
+
+
+def no_private_path(text, tmp_path):
+    for form in (str(tmp_path), tmp_path.as_posix(), str(tmp_path.parent), tmp_path.parent.as_posix()):
+        assert form not in text
+    return True
+
+
+def test_a_failure_message_does_not_show_where_the_files_are(tmp_path, monkeypatch, capsys):
+    fresh_sources(monkeypatch)
+    cache_file = tmp_path / "cache" / "openaip" / "gb__apt.ndgeojson"
+
+    def refuse(cache, log=None):
+        raise PermissionError(13, "Permission denied", str(cache_file))
+
+    monkeypatch.setattr(repackage_release.base, "load_openaip", refuse)
+    code, out = run(tmp_path, seed_zip(tmp_path, SEEDED))
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "Permission denied: gb__apt.ndgeojson" in captured.err
+    assert no_private_path(captured.err + captured.out, tmp_path)
+
+
+def test_a_missing_or_broken_seed_is_named_by_its_file_name_only(tmp_path, monkeypatch, capsys):
+    fresh_sources(monkeypatch)
+    assert run(tmp_path, tmp_path / "seed" / "EG_2611.zip")[0] == 1
+    broken = tmp_path / "seed" / "EG_2612.zip"
+    broken.parent.mkdir(parents=True, exist_ok=True)
+    broken.write_bytes(b"not a zip")
+    assert run(tmp_path, broken)[0] == 1
+    captured = capsys.readouterr()
+    assert "EG_2611.zip was not found" in captured.err
+    assert "EG_2612.zip is not a navdata ZIP" in captured.err
+    assert no_private_path(captured.err + captured.out, tmp_path)
+
+
+def test_a_failure_while_packaging_is_reported_without_the_path(tmp_path, monkeypatch, capsys):
+    fresh_sources(monkeypatch)
+
+    def refuse(stage, out_dir, *args, **kwargs):
+        raise OSError(28, "No space left on device", str(out_dir / "ALL_2611.zip"))
+
+    monkeypatch.setattr(repackage_release.regions, "build_global_zip", refuse)
+    code, out = run(tmp_path, seed_zip(tmp_path, SEEDED))
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "No space left on device: ALL_2611.zip" in captured.err
+    assert no_private_path(captured.err + captured.out, tmp_path)
+    assert list(out.iterdir()) == []
+
+
+def test_paths_in_messages_are_cut_to_the_file_name(tmp_path):
+    from skyhigh_navdata import pack
+
+    assert pack.scrub_paths("cannot open C:\\Users\\someone\\build\\EG_2611.zip now") == \
+        "cannot open EG_2611.zip now"
+    assert pack.scrub_paths("wrote /home/someone/dist/EG_2611.zip") == "wrote EG_2611.zip"
+    assert pack.scrub_paths("see https://example.invalid/a/b.zip and dist/EG_2611.zip") == \
+        "see https://example.invalid/a/b.zip and dist/EG_2611.zip"
+    assert pack.scrub_paths("ENR 2.1 / AD 2.17, cycle 11/26") == "ENR 2.1 / AD 2.17, cycle 11/26"
+    assert pack.display_path("dist/EG_2611.zip") == "dist/EG_2611.zip"
+    assert pack.display_path(tmp_path / "x" / "EG_2611.zip") == "EG_2611.zip"
+    assert pack.display_path(pack.REPO_ROOT / "CONFIG" / "nav") == "CONFIG/nav"
+    error = FileNotFoundError(2, "No such file or directory", str(tmp_path / "gone.csv"))
+    assert pack.error_text(error) == "No such file or directory: gone.csv"
+    assert str(tmp_path) not in pack.error_text(RuntimeError("bad file %s" % (tmp_path / "a.zip")))

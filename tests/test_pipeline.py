@@ -269,3 +269,67 @@ def test_build_navdata_stops_when_a_base_source_fails(tmp_path, monkeypatch, cap
                                "--skip-layouts", "--skip-airspace", "--no-overrides", "--quiet"]) == 1
     assert list(out.glob("*.zip")) == []
     assert "No ZIP was built" in capsys.readouterr().err
+
+
+def navaid_idents(files):
+    return [line.split()[7] for line in files["CONFIG/nav/navaid.dat"].splitlines()[:-1]]
+
+
+def test_a_run_that_fails_after_the_strip_reseeds_on_the_next_one(offline, monkeypatch):
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none"]) == 0
+    first, _ = read_zip(offline / "EG_2611.zip")
+    assert navaid_idents(first) == ["LON", "CDG"]
+
+    def broken(nav_dir, cycle, log=None):
+        raise RuntimeError("the CTR table could not be built")
+
+    monkeypatch.setattr(make_airac.build_navdata, "build_ctr_positions", broken)
+    assert make_airac.main(["--out", str(offline), "--only", "ctr"]) == 1
+    stage = offline / ".staging-EG"
+    assert not (stage / "manifest.json").exists()
+
+    monkeypatch.setattr(make_airac.build_navdata, "build_ctr_positions",
+                        lambda nav_dir, cycle, log=None: None)
+    for _attempt in range(2):
+        assert make_airac.main(["--out", str(offline), "--only", "ctr"]) == 0
+        files, manifest = read_zip(offline / "EG_2611.zip")
+        assert navaid_idents(files) == ["LON", "CDG"]
+        rows = files["CONFIG/nav/AD-positions"].splitlines()
+        assert sorted(row.split()[0] for row in rows[:-1]) == ["EGLL", "KJFK", "LFPG", "LFPO"]
+        assert manifest["counts"]["base_rows_navaids"] == 1
+        assert manifest["counts"]["base_rows_aerodromes"] == 3
+
+
+def test_a_kept_staging_tree_is_safe_to_run_on_again(offline, monkeypatch):
+    monkeypatch.setattr(make_airac.build_navdata, "build_ctr_positions",
+                        lambda nav_dir, cycle, log=None: None)
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none",
+                            "--keep-staging"]) == 0
+    for _attempt in range(3):
+        assert make_airac.main(["--out", str(offline), "--only", "ctr,airspace", "--keep-staging"]) == 0
+    files, manifest = read_zip(offline / "EG_2611.zip")
+    assert navaid_idents(files) == ["LON", "CDG"]
+    assert files["CONFIG/nav/AD-positions"].splitlines()[-1] == "4"
+    assert sorted(name for name in files if name.endswith(".lst")) == [
+        "CONFIG/bg/ENR21.lst", "CONFIG/bg/OAIPFR.lst", "CONFIG/bg/OAIPGB.lst"]
+
+
+def test_a_failed_build_does_not_print_where_the_files_are(offline, monkeypatch, capsys):
+    def refuse(cache_dir, log=None, progress_cb=None):
+        raise PermissionError(13, "Permission denied", str(offline / "cache" / "openaip.json"))
+
+    monkeypatch.setattr(make_airac.base, "load_openaip", refuse)
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none"]) == 1
+    captured = capsys.readouterr()
+    assert "Permission denied: openaip.json" in captured.err
+    for form in (str(offline), offline.as_posix()):
+        assert form not in captured.err
+
+
+def test_a_selective_openaip_run_keeps_the_nats_credit(offline):
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none"]) == 0
+    assert make_airac.main(["--out", str(offline), "--only", "airspace",
+                            "--airspace-source", "openaip"]) == 0
+    files, manifest = read_zip(offline / "EG_2611.zip")
+    assert "CONFIG/bg/ENR21.lst" in files
+    assert "NATS" in manifest["sources"]["airspace"] and "openAIP" in manifest["sources"]["airspace"]
