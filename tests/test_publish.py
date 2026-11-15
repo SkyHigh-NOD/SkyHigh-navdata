@@ -252,6 +252,40 @@ def test_the_menu_never_adds_single_to_a_part_rebuild(monkeypatch):
     assert make_full.main_menu() == ["--only", "airspace"]
 
 
+@pytest.mark.parametrize("uploading, live", [("2611.zip", "EG_2611.zip"), ("EG_2611.zip", "2611.zip")])
+def test_the_combined_navdata_under_its_other_name_is_a_conflict(tmp_path, monkeypatch, uploading, live):
+    calls = fake_gh(monkeypatch, [live, "ALL_2611.zip"])
+    with pytest.raises(RuntimeError, match=live.replace(".", r"\.")):
+        make_airac.publish([release_zip(tmp_path, uploading)], "2611", "11/26", lambda m: None)
+    assert not any("upload" in command or "delete-asset" in command for command in calls)
+
+
+@pytest.mark.parametrize("uploading, live", [("2611.zip", "EG_2611.zip"), ("EG_2611.zip", "2611.zip")])
+def test_clobber_deletes_the_other_combined_asset_after_the_upload(tmp_path, monkeypatch, uploading, live):
+    calls = fake_gh(monkeypatch, [live, "ALL_2611.zip"])
+    make_airac.publish([release_zip(tmp_path, uploading)], "2611", "11/26",
+                       lambda m: None, clobber=True)
+    verbs = [command[2] for command in calls if command[1] == "release"]
+    assert verbs.index("upload") < verbs.index("delete-asset")
+    deleted = [command for command in calls if "delete-asset" in command]
+    assert len(deleted) == 1 and live in deleted[0] and "ALL_2611.zip" not in deleted[0]
+
+
+def test_a_region_upload_does_not_touch_the_combined_asset(tmp_path, monkeypatch):
+    calls = fake_gh(monkeypatch, ["EG_2611.zip", "2610.zip"])
+    make_airac.publish([release_zip(tmp_path, "LF_2611.zip")], "2611", "11/26", lambda m: None)
+    assert any("upload" in command for command in calls)
+    assert not any("delete-asset" in command for command in calls)
+
+
+def test_both_combined_names_are_never_uploaded_together(tmp_path, monkeypatch):
+    calls = fake_gh(monkeypatch, [])
+    with pytest.raises(RuntimeError, match="one name only"):
+        make_airac.publish([release_zip(tmp_path, "EG_2611.zip"), release_zip(tmp_path, "2611.zip")],
+                           "2611", "11/26", lambda m: None, clobber=True)
+    assert calls == []
+
+
 def test_single_mode_is_still_there_when_asked_for():
     assert make_airac.parse_args(["--single"]).single is True
     assert make_airac.parse_args([]).single is False

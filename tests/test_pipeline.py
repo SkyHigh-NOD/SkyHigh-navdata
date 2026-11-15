@@ -192,3 +192,80 @@ def test_a_selective_airspace_run_rebuilds_both_by_default(offline):
     assert "CONFIG/bg/ENR21.lst" in files
     assert "CONFIG/bg/OAIPGB.lst" in files and "CONFIG/bg/OAIPFR.lst" in files
     assert "CONFIG/bg/OAIP-countries" in files
+
+
+def test_a_failed_ourairports_load_stops_the_build(offline, monkeypatch, capsys):
+    def refuse(cache_dir, log=None):
+        raise make_airac.base.BaseDataError("OurAirports could not be downloaded")
+
+    monkeypatch.setattr(make_airac.base, "load_ourairports", refuse)
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--single",
+                            "--regions", "none", "--publish"]) == 1
+    assert list(offline.glob("*.zip")) == []
+    assert "OurAirports could not be downloaded" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("source", ["load_ourairports", "load_openaip"])
+def test_a_base_source_that_returns_nothing_stops_the_build(offline, monkeypatch, source):
+    empty = {"airports": {}, "navaids": {}, "vfr_points": {}, "airspaces": [], "counts": {}}
+    monkeypatch.setattr(make_airac.base, source, lambda *args, **kwargs: dict(empty))
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none"]) == 1
+    assert list(offline.glob("*.zip")) == []
+
+
+def test_no_base_still_builds_when_the_sources_are_down(offline, monkeypatch):
+    def refuse(*args, **kwargs):
+        pytest.fail("the base is not loaded with --no-base")
+
+    monkeypatch.setattr(make_airac.base, "load_ourairports", refuse)
+    monkeypatch.setattr(make_airac.base, "load_openaip", refuse)
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--no-base"]) == 0
+    assert (offline / "EG_2611.zip").is_file()
+
+
+def test_a_selective_merge_starts_again_from_the_skyhigh_rows(offline, tmp_path, monkeypatch):
+    assert make_airac.main(["--out", str(offline), "--skip-layouts", "--regions", "none"]) == 0
+    files, manifest = read_zip(offline / "EG_2611.zip")
+    assert "KJFK 40.640000,-73.780000 Kennedy" in files["CONFIG/nav/AD-positions"]
+    assert manifest["counts"]["base_rows_aerodromes"] == 3
+
+    # openAIP gains an aerodrome that OurAirports supplied in the first build
+    def newer_openaip(cache_dir, log=None, progress_cb=None):
+        data = fake_openaip(cache_dir)
+        data["airports"]["KJFK"] = {"lat": 40.64, "lon": -73.78, "name": "JFK from openAIP",
+                                    "country": "US"}
+        del data["airports"]["LFPO"]
+        return data
+
+    monkeypatch.setattr(make_airac.base, "load_openaip", newer_openaip)
+    overrides = tmp_path / "CONFIG"
+    (overrides / "nav").mkdir(parents=True)
+    (overrides / "nav" / "navaid.dat").write_text(
+        "2 55.000000 -3.000000 80 114.00 0 0 OVR 0 EG Override\n99\n", encoding="utf-8")
+    monkeypatch.setattr(make_airac, "OVERRIDES_DIR", overrides)
+    assert make_airac.main(["--out", str(offline), "--only", "airspace"]) == 0
+    files, manifest = read_zip(offline / "EG_2611.zip")
+    rows = files["CONFIG/nav/AD-positions"].splitlines()
+    assert [row.split()[0] for row in rows[:-1]] == ["EGLL", "KJFK", "LFPG"]
+    assert "JFK from openAIP" in rows[1] and rows[-1] == "3"
+    assert manifest["counts"]["base_rows_aerodromes"] == 2
+    assert manifest["counts"]["base_rows_navaids"] == 1
+
+
+def test_build_navdata_stops_when_a_base_source_fails(tmp_path, monkeypatch, capsys):
+    import build_navdata
+
+    html = tmp_path / "html"
+    html.mkdir()
+    monkeypatch.setattr(build_navdata, "build_navdata_from_html", fake_nav_build)
+    monkeypatch.setattr(build_navdata.base, "load_openaip", fake_openaip)
+
+    def refuse(cache_dir, log=None):
+        raise build_navdata.base.BaseDataError("OurAirports could not be downloaded")
+
+    monkeypatch.setattr(build_navdata.base, "load_ourairports", refuse)
+    out = tmp_path / "dist"
+    assert build_navdata.main(["--airac", "2611", "--source-dir", str(html), "--out", str(out),
+                               "--skip-layouts", "--skip-airspace", "--no-overrides", "--quiet"]) == 1
+    assert list(out.glob("*.zip")) == []
+    assert "No ZIP was built" in capsys.readouterr().err
