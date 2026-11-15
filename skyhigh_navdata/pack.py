@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,85 @@ SCHEMA_VERSION = 1
 # with the installer in skyradar/gui/dialogs/airac_update.py.
 ALLOWED_PREFIXES = ("CONFIG/nav/", "CONFIG/ad/", "CONFIG/bg/")
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# An absolute path inside a message: a drive or UNC path, or one from the
+# root. A URL and a relative path (dist/EG_2611.zip) do not match.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"""(?<![\w:/.\\-])(?:[A-Za-z]:[\\/]|\\\\|/)(?:[^\s'"<>|*?\\/]+[\\/]+)+([^\s'"<>|*?\\/]*)""")
+
+
+def display_path(path) -> str:
+    """A path as a message may show it: never absolute.
+
+    Relative to the working directory or the repository when it is inside
+    one of them, and the base name alone otherwise. Messages end up in
+    terminals, logs and pasted bug reports; where the builder keeps its files
+    is nobody else's business.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        return path.as_posix()
+    for root in (Path.cwd(), REPO_ROOT):
+        try:
+            return path.resolve().relative_to(root.resolve()).as_posix() or "."
+        except (OSError, ValueError):
+            continue
+    return path.name or "."
+
+
+# A quoted absolute path, which may hold spaces: the quotes say where it ends.
+_QUOTED_PATH_RE = re.compile(r"""(['"])((?:[A-Za-z]:[\\/]|\\\\|/)[^'"\n]*)\1""")
+
+
+def _private_roots() -> list:
+    """Folders whose location must not show: longest first, in both slash forms."""
+    found = set()
+    for get in (Path.home, Path.cwd, lambda: REPO_ROOT, lambda: Path(tempfile.gettempdir())):
+        try:
+            root = get()
+            for form in (str(root), root.as_posix(), str(root.resolve()), root.resolve().as_posix()):
+                if len(form) > 3:
+                    found.add(form)
+        except (OSError, RuntimeError):
+            continue
+    return sorted(found, key=len, reverse=True)
+
+
+def scrub_paths(text) -> str:
+    """``text`` with every absolute path in it cut down to its base name.
+
+    Three passes, because a path with a space in it has no end a pattern can
+    find: quoted paths first, then anything under a folder this tool knows
+    (home, working directory, repository, temp), then whatever still looks
+    like an absolute path.
+    """
+    text = str(text)
+
+    def base_name(match):
+        name = re.split(r"[\\/]+", match.group(2).rstrip("\\/"))[-1]
+        return "%s%s%s" % (match.group(1), name or "(folder)", match.group(1))
+
+    text = _QUOTED_PATH_RE.sub(base_name, text)
+    for root in _private_roots():
+        text = re.sub(re.escape(root) + r"[\\/]+", "", text, flags=re.IGNORECASE)
+        text = re.sub(re.escape(root), "(folder)", text, flags=re.IGNORECASE)
+    return _ABSOLUTE_PATH_RE.sub(lambda match: match.group(1) or "(folder)", text)
+
+
+def error_text(error) -> str:
+    """What went wrong, in words fit for a message: no absolute path.
+
+    An OSError names its file by the full path. Here it is the reason and the
+    file's base name; any other error has the paths in its text scrubbed.
+    """
+    reason = getattr(error, "strerror", None)
+    filename = getattr(error, "filename", None)
+    if isinstance(error, OSError) and isinstance(reason, str) and reason and filename:
+        names = [Path(str(name)).name for name in (filename, getattr(error, "filename2", None)) if name]
+        return scrub_paths("%s: %s" % (reason, " -> ".join(names)))
+    return scrub_paths(error)
+
 
 def allowed_relative_path(relative: str) -> bool:
     """True if a zip/manifest path is one the tool is allowed to create."""
@@ -27,6 +107,19 @@ def allowed_relative_path(relative: str) -> bool:
     if len(relative) > 1 and relative[1] == ":":
         return False
     return relative.startswith(ALLOWED_PREFIXES)
+
+
+def safe_extract(archive: zipfile.ZipFile, dest_dir) -> None:
+    """Extract an archive, refusing any member that would land outside ``dest_dir``."""
+    dest_dir = Path(dest_dir)
+    root = dest_dir.resolve()
+    for member in archive.infolist():
+        name = member.filename.replace("\\", "/")
+        target = (root / name).resolve()
+        if name.startswith("/") or (len(name) > 1 and name[1] == ":") \
+                or ".." in name.split("/") or (target != root and root not in target.parents):
+            raise ValueError("archive member escapes the extraction folder: %r" % member.filename)
+    archive.extractall(dest_dir)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -98,7 +191,7 @@ def apply_overrides(stage_dir, overrides_dir, log=None) -> list:
         shutil.copyfile(source, target)
         applied.append(relative)
         if log:
-            log("Override: %s (from %s)" % (relative, source))
+            log("Override: %s" % relative)
     return applied
 
 
@@ -260,6 +353,12 @@ _COUNT_LABELS = {
     "layouts_custom": "Local layout overrides",
     "layouts_unavailable": "Layouts unavailable",
     "layouts_failed": "Layouts failed",
+    "base_vfr_points": "openAIP VFR reporting points",
+    "base_navaids": "openAIP navaids added",
+    "base_aerodromes": "Base aerodrome positions added",
+    "base_rows_navaids": "Base rows at the end of navaid.dat",
+    "base_rows_aerodromes": "Base rows at the end of AD-positions",
+    "airspace_drawings": "openAIP airspace drawings",
     "overrides": "Local CONFIG overrides",
 }
 

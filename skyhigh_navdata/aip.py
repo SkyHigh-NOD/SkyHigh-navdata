@@ -8,10 +8,13 @@ import shutil
 import tempfile
 import time
 import zipfile
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
+
+from .pack import display_path, error_text, safe_extract
 
 NATS_AIP_URL = "https://nats-uk.ead-it.com/cms-nats/opencms/en/Publications/AIP/"
 GATEWAY_API_BASE = "https://gateway.x-plane.com/apiv1"
@@ -24,14 +27,53 @@ def request_url(url: str) -> Request:
     return Request(url, headers={"User-Agent": USER_AGENT})
 
 
-def download_file(url: str, destination: Path, timeout: int = 120) -> None:
+def download_file(url: str, destination: Path, timeout: int = 120,
+                  progress_cb=None) -> None:
+    """Stream a URL to disk. ``progress_cb(bytes_done, bytes_total)`` fires per
+    chunk when supplied. When the server omits Content-Length on the GET, a
+    HEAD request fills the gap for the progress display; 0 means genuinely
+    unknown. Nobody reads the total without a callback, so no HEAD is sent
+    then.
+
+    The body goes to a ``.part`` file that only takes the destination's name
+    once it is complete, so an interrupted download never looks like a file.
+    """
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urlopen(request_url(url), timeout=timeout) as response, destination.open("wb") as output:
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        _stream_to(url, partial, timeout, progress_cb)
+        os.replace(partial, destination)
+    finally:
+        if partial.exists():
+            partial.unlink()
+
+
+def _stream_to(url: str, partial: Path, timeout: int, progress_cb) -> None:
+    with urlopen(request_url(url), timeout=timeout) as response, partial.open("wb") as output:
+        total_header = response.headers.get("Content-Length")
+        total = int(total_header) if total_header and total_header.isdigit() else 0
+        declared = total
+        if not total and progress_cb:
+            try:
+                with urlopen(Request(url, headers={"User-Agent": USER_AGENT},
+                                     method="HEAD"), timeout=30) as head:
+                    head_length = head.headers.get("Content-Length")
+                    if head_length and head_length.isdigit():
+                        total = int(head_length)
+            except (OSError, HTTPException):
+                pass  # the total only feeds the progress display
+        done = 0
         while True:
-            chunk = response.read(1024 * 1024)
+            chunk = response.read(512 * 1024)
             if not chunk:
                 break
             output.write(chunk)
+            done += len(chunk)
+            if progress_cb:
+                progress_cb(done, total)
+        if declared and done < declared:
+            raise OSError("download stopped at %d of %d bytes" % (done, declared))
 
 
 # --- NATS UK eAIP -----------------------------------------------------------
@@ -47,8 +89,37 @@ def find_current_nats_airac():
     return "%s/%s" % (cycle.group(1), cycle.group(2)[-2:]), urljoin(NATS_AIP_URL, archive.group(1))
 
 
-def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
-    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir)."""
+def archive_source_path(archive_path: Path) -> Path:
+    """Where the URL a cached archive was downloaded from is recorded."""
+    archive_path = Path(archive_path)
+    return archive_path.with_name(archive_path.name + ".source")
+
+
+def cached_archive_usable(archive_path: Path, zip_url: str) -> bool:
+    """True when the cached archive is complete and is the one at ``zip_url``.
+
+    The NATS link names the cycle (``AIRAC-10-26.zip``), so an archive whose
+    recorded URL differs holds another cycle's data. One with no record, or
+    one that does not open as a ZIP, is not trusted either.
+    """
+    archive_path = Path(archive_path)
+    source_note = archive_source_path(archive_path)
+    if not archive_path.is_file() or not source_note.is_file():
+        return False
+    try:
+        if source_note.read_text(encoding="utf-8").strip() != zip_url:
+            return False
+        with zipfile.ZipFile(archive_path) as archive:
+            return bool(archive.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
+
+
+def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tuple[str, Path]:
+    """Download the current NATS AIRAC ZIP and extract it. Returns (cycle, html_dir).
+
+    ``progress_cb(bytes_done, bytes_total)`` tracks the download when supplied.
+    """
     cycle, zip_url = find_current_nats_airac()
     if log:
         log("Detected AIRAC cycle: %s" % cycle)
@@ -57,14 +128,28 @@ def download_and_extract_airac(dest_dir: Path, log=None) -> tuple[str, Path]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     html_dir = dest_dir / "html"
     archive_path = dest_dir / "nats-airac.zip"
-    download_file(zip_url, archive_path)
+
+    if cached_archive_usable(archive_path, zip_url):
+        if log:
+            log("Found the NATS ZIP for this cycle (%.0f MB) - reusing it, no download."
+                % (archive_path.stat().st_size / 1e6))
+    else:
+        if archive_path.exists():
+            if log:
+                log("The cached NATS ZIP is incomplete or from another cycle - downloading again.")
+            archive_path.unlink()
+        source_note = archive_source_path(archive_path)
+        if source_note.exists():
+            source_note.unlink()
+        download_file(zip_url, archive_path, progress_cb=progress_cb)
+        source_note.write_text(zip_url + "\n", encoding="utf-8")
     if html_dir.exists():
         shutil.rmtree(html_dir)
     html_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(html_dir)
+        safe_extract(archive, html_dir)
     if log:
-        log("Extracted AIRAC archive to %s" % html_dir)
+        log("Extracted AIRAC archive to %s" % display_path(html_dir))
     return cycle, html_dir
 
 
@@ -159,7 +244,7 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
                 content = archive.read(preferred)
         except zipfile.BadZipFile as error:
             if log:
-                log("Gateway download for %s scenery %s is not a valid ZIP: %s" % (icao, scenery_id, error))
+                log("Gateway download for %s scenery %s is not a valid ZIP: %s" % (icao, scenery_id, error_text(error)))
             return False
         except HTTPError as error:
             if log:
@@ -172,41 +257,45 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
     temporary.write_bytes(content)
     os.replace(temporary, output_path)
     if log:
-        log("Wrote airport layout: %s" % output_path)
+        log("Wrote airport layout: %s" % output_path.name)
     return True
 
 
-def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None) -> dict:
+def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None, progress_cb=None) -> dict:
     """Download one apt.dat per aerodrome into ``ad_dir``. Returns a counts summary.
 
     ``skip`` is an optional collection of ICAOs that already have a local
     override; those are left for the caller to supply instead of downloading.
+    ``progress_cb(done, total, icao)`` is called per aerodrome when supplied.
     """
     ad_dir = Path(ad_dir)
     ad_dir.mkdir(parents=True, exist_ok=True)
     skip = {code.upper() for code in skip} if skip else set()
     downloaded = unavailable = failed = custom = 0
     layouts = []
+    total = len(icaos)
     for index, icao in enumerate(icaos, start=1):
         if icao.upper() in skip:
             custom += 1
             if log:
-                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, len(icaos), icao))
-            continue
-        output = ad_dir / (icao.upper() + ".dat")
-        if log:
-            log("[%d/%d] X-Plane Gateway layout: %s" % (index, len(icaos), icao))
-        try:
-            if write_gateway_layout(icao, output, log):
-                downloaded += 1
-                layouts.append(icao.upper())
-            else:
-                unavailable += 1
-        except Exception as error:  # noqa: BLE001 - keep going on individual failures
-            failed += 1
+                log("[%d/%d] X-Plane Gateway layout: %s (local override)" % (index, total, icao))
+        else:
+            output = ad_dir / (icao.upper() + ".dat")
             if log:
-                log("Failed to download %s layout: %s" % (icao, error))
-        time.sleep(0.25)
+                log("[%d/%d] X-Plane Gateway layout: %s" % (index, total, icao))
+            try:
+                if write_gateway_layout(icao, output, log):
+                    downloaded += 1
+                    layouts.append(icao.upper())
+                else:
+                    unavailable += 1
+            except Exception as error:  # noqa: BLE001 - keep going on individual failures
+                failed += 1
+                if log:
+                    log("Failed to download %s layout: %s" % (icao, error_text(error)))
+            time.sleep(0.25)
+        if progress_cb:
+            progress_cb(index, total, icao)
     if log:
         log("Airport layouts complete: %d downloaded, %d overridden, %d unavailable, %d failed."
             % (downloaded, custom, unavailable, failed))
