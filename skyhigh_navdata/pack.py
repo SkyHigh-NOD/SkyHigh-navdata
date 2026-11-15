@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import zipfile
 from datetime import datetime, timezone
@@ -126,6 +127,40 @@ def build_manifest(stage_dir, *, region: str = REGION, airac: str = "", airac_co
         "files": files,
     }
     return manifest
+
+
+# A drive path (C:\ or C:/) or a Unix home folder anywhere in a string. The
+# drive letter stands alone, so the "s:/" inside "https://" is not one.
+_LOCAL_PATH = re.compile(r"(?<![A-Za-z])[A-Za-z]:[\\/]|/(?:Users|home)/")
+
+
+def local_paths_in(manifest) -> list:
+    """Manifest fields whose text holds a path from the building machine.
+
+    The manifest ships inside a public release and is copied into the release
+    notes, so a home folder or a drive path in it publishes the builder's
+    account name. Returns the dotted names of the offending fields; the file
+    list is relative to the package by construction and is not scanned.
+    """
+    home = str(Path.home())
+    marks = (home, home.replace("\\", "/"))
+
+    def scan(value, name, found):
+        if isinstance(value, dict):
+            for key, inner in value.items():
+                scan(inner, "%s.%s" % (name, key), found)
+        elif isinstance(value, (list, tuple)):
+            for index, inner in enumerate(value):
+                scan(inner, "%s[%d]" % (name, index), found)
+        elif isinstance(value, str):
+            if any(mark in value for mark in marks) or _LOCAL_PATH.search(value):
+                found.append(name)
+
+    found = []
+    for key, value in (manifest or {}).items():
+        if key != "files":
+            scan(value, str(key), found)
+    return found
 
 
 def write_manifest(stage_dir, manifest) -> Path:
