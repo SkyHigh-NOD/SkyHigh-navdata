@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import time
 import zipfile
+from http.client import HTTPException
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urljoin
@@ -60,8 +61,8 @@ def _stream_to(url: str, partial: Path, timeout: int, progress_cb) -> None:
                     head_length = head.headers.get("Content-Length")
                     if head_length and head_length.isdigit():
                         total = int(head_length)
-            except OSError:
-                pass
+            except (OSError, HTTPException):
+                pass  # the total only feeds the progress display
         done = 0
         while True:
             chunk = response.read(512 * 1024)

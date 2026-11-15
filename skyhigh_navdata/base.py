@@ -23,9 +23,11 @@ only touches what actually changed.
 from __future__ import annotations
 
 import csv
+import http.client
 import io
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,10 +51,59 @@ SOURCES = {
 NDGEOJSON_KEY_RE = re.compile(r"^[a-z]{2}_(?:%s)\.ndgeojson$" % "|".join(OPENAIP_TYPES))
 
 
+# What a download can fail with. http.client.HTTPException covers a response
+# that ends early (IncompleteRead) or a connection the server drops, which are
+# neither URLError nor OSError.
+DOWNLOAD_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError)
+
+FETCH_ATTEMPTS = 3
+RETRY_PAUSE = 2.0
+OURAIRPORTS_BRANCH = "main"
+
+
+class BaseDataError(RuntimeError):
+    """A base source the build was asked to use gave it nothing."""
+
+
+def require_base(openaip, ourairports) -> dict:
+    """The two loaded sources as one base dataset, or ``BaseDataError``.
+
+    A build that was asked for the base data must not go on to package
+    without it: the ZIP would look complete and be missing the world.
+    """
+    openaip = openaip or {}
+    if not (openaip.get("airports") or openaip.get("navaids") or openaip.get("airspaces")):
+        raise BaseDataError(
+            "openAIP gave no airports, navaids or airspace. Nothing was packaged; "
+            "run the build again, or pass --no-base to build without the base data.")
+    if not (ourairports or {}).get("airports"):
+        raise BaseDataError(
+            "OurAirports gave no aerodromes. Nothing was packaged; run the build "
+            "again, or pass --no-base to build without the base data.")
+    data = dict(openaip)
+    data["ourairports"] = ourairports
+    return data
+
+
+def _worth_retrying(error) -> bool:
+    """A refusal (404, 403) will not change on a second request; the rest may."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code in (408, 425, 429) or error.code >= 500
+    return True
+
+
 def _fetch(url: str, timeout: int = 120) -> bytes:
+    """The body of ``url``, asked for up to ``FETCH_ATTEMPTS`` times."""
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+    for attempt in range(1, FETCH_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
+        except DOWNLOAD_ERRORS as error:
+            if attempt == FETCH_ATTEMPTS or not _worth_retrying(error):
+                raise
+            time.sleep(RETRY_PAUSE)
+    raise AssertionError("unreachable")
 
 
 def _download_to(url: str, path: Path, timeout: int = 300) -> None:
@@ -87,7 +138,7 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
     # full listing with LastModified stamps, so unchanged files stay cached
     try:
         listing = _openaip_listing(cache_dir, log)
-    except (urllib.error.URLError, OSError) as error:
+    except DOWNLOAD_ERRORS as error:
         # The exports already on disk are still good data. Without any, there
         # is nothing to build the base from and the caller has to know.
         listing = _cached_listing(cache_dir, cache)
@@ -114,7 +165,7 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
         if cache.get(key) != stamp or not path.is_file():
             try:
                 _download_to(info["url"], path)
-            except (urllib.error.URLError, OSError) as error:
+            except DOWNLOAD_ERRORS as error:
                 # The stamp is not recorded, so the next build asks again. An
                 # older copy on disk is still parsed below.
                 if log:
@@ -143,6 +194,11 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
     if log:
         log("openAIP: %d file(s) downloaded, %d airports, %d navaids, %d VFR reporting points, "
             "%d airspaces" % (changed, len(airports), len(navaids), len(vfr_points), len(airspaces)))
+    if not (airports or navaids or airspaces):
+        raise BaseDataError(
+            "openAIP gave no airports, navaids or airspace (%d export(s) listed). "
+            "Nothing was packaged; run the build again, or pass --no-base to build "
+            "without the base data." % total)
 
     return {
         "airports": airports,
@@ -411,7 +467,9 @@ def load_ourairports(cache_dir: Path, log=None) -> dict:
     """Download (SHA-cached) and parse the OurAirports CSV.
 
     Returns ``{"airports": icao → {lat, lon, name, country}, "counts": ...}``
-    for every non-closed entry with an ICAO code.
+    for every non-closed entry with an ICAO code. Raises ``BaseDataError``
+    when there is no CSV to read, neither downloaded nor cached, or it holds
+    no aerodrome.
     """
     cache_dir = Path(cache_dir)
     cache_path = cache_dir / "ourairports.json"
@@ -429,33 +487,49 @@ def load_ourairports(cache_dir: Path, log=None) -> dict:
                    % (OURAIRPORTS_REPO, OURAIRPORTS_CSV)).decode("utf-8"))
         if commits and isinstance(commits, list):
             sha = str(commits[0].get("sha") or "")
-    except (urllib.error.URLError, ValueError, OSError) as error:
+    except (*DOWNLOAD_ERRORS, ValueError) as error:
         if log:
             log("OurAirports: WARNING - could not check the latest revision (%s)" % error)
-    if sha and sha == cached_sha and (cache_dir / "ourairports.csv").is_file():
+    csv_path = cache_dir / "ourairports.csv"
+    failure = ""
+    if sha and sha == cached_sha and csv_path.is_file():
         if log:
             log("OurAirports: %s is current - reusing the cached CSV" % sha[:12])
-    elif sha:
+    elif sha or not csv_path.is_file():
+        # Without a revision to pin (the lookup failed) and nothing cached,
+        # the branch head is fetched. It is not recorded as a revision, so
+        # the next build checks again.
+        ref = sha or OURAIRPORTS_BRANCH
         if log:
-            log("OurAirports: downloading %s (%s...)" % (OURAIRPORTS_CSV, sha[:12]))
+            log("OurAirports: downloading %s (%s)" % (OURAIRPORTS_CSV, ref[:12]))
         try:
             _download_to(
                 "https://raw.githubusercontent.com/%s/%s/%s"
-                % (OURAIRPORTS_REPO, sha, OURAIRPORTS_CSV),
-                cache_dir / "ourairports.csv",
+                % (OURAIRPORTS_REPO, ref, OURAIRPORTS_CSV),
+                csv_path,
             )
-            cache_path.write_text(json.dumps({"sha": sha}) + "\n", encoding="utf-8")
-        except (urllib.error.URLError, OSError) as error:
+            if sha:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                cache_path.write_text(json.dumps({"sha": sha}) + "\n", encoding="utf-8")
+        except DOWNLOAD_ERRORS as error:
+            failure = str(error)
             if log:
                 log("OurAirports: WARNING - download failed (%s)" % error)
-            sha = ""
+    elif log:
+        log("OurAirports: using the cached CSV")
 
-    csv_path = cache_dir / "ourairports.csv"
     if not csv_path.is_file():
-        return {"airports": {}, "counts": {"base_ourairports_airports": 0}}
+        raise BaseDataError(
+            "OurAirports could not be downloaded%s and no copy is cached. Nothing was "
+            "packaged; run the build again, or pass --no-base to build without the "
+            "base data." % (" (%s)" % failure if failure else ""))
 
     text = csv_path.read_text(encoding="utf-8", errors="replace")
     airports = parse_ourairports_csv(text)
+    if not airports:
+        raise BaseDataError(
+            "The OurAirports CSV holds no aerodrome with an ICAO code. Nothing was "
+            "packaged; delete the cached ourairports.csv and run the build again.")
     if log:
         log("OurAirports: %d aerodromes parsed" % len(airports))
     return {

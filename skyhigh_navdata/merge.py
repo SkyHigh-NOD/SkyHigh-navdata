@@ -197,6 +197,69 @@ def merge_aerodromes(nav_dir: Path, base: dict, log=None) -> int:
     return added
 
 
+def _tail_count(counts, key, limit):
+    """The recorded number of base rows, or None when it cannot be trusted."""
+    value = (counts or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= limit else None
+
+
+def strip_base_rows(stage_dir: Path, manifest=None, region: str = "EG", log=None) -> dict:
+    """Take the base rows of an earlier merge back out of a seeded tree.
+
+    A tree unpacked from a published ZIP already holds the rows an earlier
+    build merged in. Merging on top of them would keep every one, so an
+    aerodrome OurAirports supplied then would still win after openAIP gained
+    it, and rows a source has since dropped would stay. This removes them, so
+    the merge that follows starts from the SkyHigh rows alone.
+
+    The merge appends, so the base rows are the last ones of each file, and a
+    manifest written by this builder records how many there are
+    (``base_rows_aerodromes``, ``base_rows_navaids``). A seed without that
+    record (an older build) is handled by what its rows say: in AD-positions
+    only the ``region`` idents (the ones the eAIP build produces) are kept,
+    unless the file is listed as an override, in which case it is left as it
+    is. navaid.dat is left alone without a record: its rows do not say where
+    they came from, and openAIP is its only base source.
+
+    Returns how many rows were removed from each file.
+    """
+    manifest = manifest or {}
+    counts = manifest.get("counts") or {}
+    overridden = set(manifest.get("overrides") or [])
+    nav_dir = Path(stage_dir) / "CONFIG" / "nav"
+    removed = {"aerodromes": 0, "navaids": 0}
+
+    path = nav_dir / "AD-positions"
+    records = [line.rstrip() for line in _read_lines(path) if AD_POSITION_LINE_RE.match(line)]
+    if records:
+        tail = _tail_count(counts, "base_rows_aerodromes", len(records))
+        if tail is not None:
+            kept = records[:len(records) - tail]
+        elif "CONFIG/nav/AD-positions" in overridden:
+            kept = records
+        else:
+            kept = [line for line in records if line.startswith(region)]
+        if len(kept) != len(records):
+            removed["aerodromes"] = len(records) - len(kept)
+            _atomic_write_text(path, "\n".join(kept + [str(len(kept))]) + "\n")
+
+    path = nav_dir / "navaid.dat"
+    lines = _read_lines(path)
+    closed = bool(lines) and lines[-1].strip() == "99"
+    body = lines[:-1] if closed else lines
+    tail = _tail_count(counts, "base_rows_navaids", len(body))
+    if tail:
+        removed["navaids"] = tail
+        _atomic_write_text(path, "\n".join(body[:len(body) - tail] + (["99"] if closed else [])) + "\n")
+
+    if log:
+        log("seed: %d base aerodrome row(s) and %d base navaid row(s) taken out before the merge"
+            % (removed["aerodromes"], removed["navaids"]))
+    return removed
+
+
 def write_notice(stage_dir: Path) -> Path:
     """Write the third-party credits into the package (``CONFIG/nav/NOTICE.txt``)."""
     path = Path(stage_dir) / "CONFIG" / "nav" / NOTICE_NAME
@@ -212,6 +275,10 @@ def merge_base_into_stage(stage_dir: Path, base: dict, log=None) -> dict:
         "base_navaids": merge_navaids(nav_dir, base, log),
         "base_aerodromes": merge_aerodromes(nav_dir, base, log),
     }
+    # Both merges append, so these are also the rows at the end of each file.
+    # strip_base_rows() reads them when a later run starts from this package.
+    counts["base_rows_navaids"] = counts["base_navaids"]
+    counts["base_rows_aerodromes"] = counts["base_aerodromes"]
     write_notice(stage_dir)
     if log:
         log("base merge: %s" % ", ".join("%s=%d" % item for item in counts.items()))

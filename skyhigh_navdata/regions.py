@@ -324,8 +324,9 @@ def write_openaip_airspace(bg_dir: Path, base_data: dict, scope: str, airac_cycl
     else:
         added = write_country_airspace_groups(bg_dir, airspaces, WORLD_BBOX, airac_cycle)
     mapped = 0
-    if added and base_data.get("ourairports"):
-        mapped = write_icao_country_map(bg_dir, base_data["ourairports"])
+    if added:
+        mapped = write_icao_country_map(
+            bg_dir, base_data.get("ourairports"), base_data.get("airports"))
     if log:
         log("airspace: %d openAIP drawing(s) in per-country groups (%s scope), "
             "%d ICAO prefix(es) mapped" % (added, scope, mapped))
@@ -354,13 +355,15 @@ def clear_openaip_groups(bg_dir: Path) -> int:
     return removed
 
 
-def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
+def write_icao_country_map(bg_dir: Path, ourairports: dict, openaip_airports=None) -> int:
     """Write ``CONFIG/bg/OAIP-countries``: one 'ICAO-prefix ISO' per line.
 
     SkyRadar reads it to pick the ``OAIP<ISO>.lst`` airspace group matching a
     position's ICAO country prefix (e.g. EG aerodromes -> the GB group). The
-    mapping is a majority vote of the staged aerodromes' countries per prefix.
-    Returns the number of prefixes written.
+    mapping is a majority vote of the aerodromes' countries per prefix, taken
+    over OurAirports and the openAIP airports together (an aerodrome in both
+    votes once, with openAIP's country), so either source alone still gives a
+    map. Returns the number of prefixes written.
     """
     from collections import Counter
     # Takes what load_ourairports returns ({"airports": {...}, "counts": {...}})
@@ -368,6 +371,8 @@ def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
     airports = ourairports or {}
     if isinstance(airports.get("airports"), dict):
         airports = airports["airports"]
+    airports = dict(airports)
+    airports.update(openaip_airports or {})
     by_prefix: dict = {}
     for icao, record in airports.items():
         if not isinstance(icao, str) or not ICAO_RE.match(icao) or not isinstance(record, dict):
@@ -460,6 +465,60 @@ def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycl
     return count, group
 
 
+DRAW_POINT_RE = re.compile(r"^(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$")
+OPENAIP_INDEX_RE = re.compile(r"^OAIP(?:[A-Z]{2})?\.lst$")
+
+
+def _draw_file_bbox(path: Path):
+    """(lat_min, lon_min, lat_max, lon_max) of a .draw file's points, or None."""
+    lats, lons = [], []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = DRAW_POINT_RE.match(line.strip())
+        if match:
+            lats.append(float(match.group(1)))
+            lons.append(float(match.group(2)))
+    if not lats:
+        return None
+    return (min(lats), min(lons), max(lats), max(lons))
+
+
+def copy_staged_airspace_groups(stage_bg: Path, region_bg: Path, bbox) -> int:
+    """Copy the staged openAIP drawings touching ``bbox`` into a region tree.
+
+    The files are taken as they are in ``stage_bg`` (``OAIP<ISO>.lst`` groups,
+    or the flat ``OAIP.lst``), never redrawn, so a region package made from a
+    published ZIP holds exactly the drawings that ZIP has. Returns how many
+    were copied; a group with no drawing in the box is not written.
+    """
+    stage_bg, region_bg = Path(stage_bg), Path(region_bg)
+    if not stage_bg.is_dir():
+        return 0
+    total = 0
+    for index_path in sorted(stage_bg.iterdir()):
+        if not index_path.is_file() or not OPENAIP_INDEX_RE.match(index_path.name):
+            continue
+        kept = []
+        for entry in index_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            relative = entry.split("  DRAW  ", 1)[0].strip()
+            if not relative or not pack.allowed_relative_path("CONFIG/bg/" + relative):
+                continue
+            source = stage_bg / relative
+            if not source.is_file():
+                continue
+            box = _draw_file_bbox(source)
+            if not box or not (box[0] <= bbox[2] and bbox[0] <= box[2]
+                               and box[1] <= bbox[3] and bbox[1] <= box[3]):
+                continue
+            target = region_bg / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            kept.append(entry.strip())
+        if kept:
+            write_lst_file(region_bg / index_path.name, kept)
+            total += len(kept)
+    return total
+
+
 def _refuse_local_paths(manifest) -> None:
     leaked = pack.local_paths_in(manifest)
     if leaked:
@@ -504,14 +563,17 @@ def build_global_zip(stage_dir: Path, out_dir: Path, airac_display: str,
 
 def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
                      airac_display: str, airac_code: str, base_airspaces=None,
-                     generator_version="", log=None, sources=None) -> Path | None:
+                     generator_version="", log=None, sources=None,
+                     staged_airspace: bool = False) -> Path | None:
     """Package one ICAO region's subset of the staged tree as <prefix>_<airac>.zip.
 
     ``base_airspaces`` is the openAIP airspace list when the build draws
     airspace from openAIP, and None when it does not (eAIP airspace only, or
     airspace skipped): the region then ships without drawings. They are
     written as the per-country groups SkyRadar reads, with the combined
-    build's ``OAIP-countries`` map. ``sources`` is the combined build's source
+    build's ``OAIP-countries`` map. With ``staged_airspace`` the openAIP
+    drawings already in the staged tree are copied instead, untouched, and
+    ``base_airspaces`` is not used. ``sources`` is the combined build's source
     list, carried into the region's manifest.
     """
     def _log(message):
@@ -582,9 +644,13 @@ def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
                 layouts += 1
         counts["layouts"] = layouts
 
-    if base_airspaces:
-        region_bg = region_stage / "CONFIG" / "bg"
+    region_bg = region_stage / "CONFIG" / "bg"
+    added = 0
+    if staged_airspace:
+        added = copy_staged_airspace_groups(Path(stage_dir) / "CONFIG" / "bg", region_bg, bbox)
+    elif base_airspaces:
         added = write_country_airspace_groups(region_bg, base_airspaces, bbox, airac_display)
+    if staged_airspace or base_airspaces:
         counts["openaip_airspaces"] = added
         country_map = Path(stage_dir) / "CONFIG" / "bg" / "OAIP-countries"
         if added and country_map.is_file():

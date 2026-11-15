@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import shutil
 import sys
-import urllib.error
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -216,17 +215,20 @@ def main(argv=None) -> int:
     base_data = None
     if not args.no_base:
         log("Loading global base data (openAIP + OurAirports) ...")
+        # A source that fails stops the build here, before anything is
+        # packaged: a ZIP without the base it was asked for looks complete
+        # and is not.
         try:
             ourairports = base.load_ourairports(Path(args.cache_dir), log=log)
             openaip = base.load_openaip(Path(args.cache_dir), log=log)
-            base_data = dict(openaip)
-            base_data["ourairports"] = ourairports
-            counts.update(ourairports.get("counts", {}))
-            counts.update(openaip.get("counts", {}))
-            sources.update(base.SOURCES)
-        except (urllib.error.URLError, OSError) as error:
-            log("WARNING: base data unavailable (%s); building SkyHigh data only." % error)
-            base_data = None
+            base_data = base.require_base(openaip, ourairports)
+        except (base.BaseDataError, *base.DOWNLOAD_ERRORS) as error:
+            print("FAILED: the base data could not be loaded (%s). No ZIP was built. "
+                  "Run the build again, or pass --no-base." % error, file=sys.stderr)
+            return 1
+        counts.update(ourairports.get("counts", {}))
+        counts.update(openaip.get("counts", {}))
+        sources.update(base.SOURCES)
 
     if args.skip_airspace:
         log("Skipping airspace drawings (--skip-airspace).")
@@ -244,7 +246,7 @@ def main(argv=None) -> int:
                     bg_dir, base_data, args.airspace_scope, cycle_display, log=log)
                 drawn.append("openAIP daily exports (CC BY-NC 4.0)")
             else:
-                log("WARNING: no openAIP airspace loaded (--no-base or fetch failed); "
+                log("WARNING: no openAIP airspace (--no-base, or the exports hold none); "
                     "CONFIG/bg has no OAIP groups.")
         sources["airspace"] = ", and ".join(drawn) if drawn else "unavailable (no openAIP data)"
     if args.skip_layouts:
@@ -338,8 +340,6 @@ def main(argv=None) -> int:
                     generator_version=__version__,
                     log=log, sources=sources,
                 ))
-    elif not args.no_base:
-        log("WARNING: no base data, so no world or region ZIPs were built.")
 
     if not args.keep_staging:
         shutil.rmtree(stage_dir, ignore_errors=True)

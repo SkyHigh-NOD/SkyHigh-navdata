@@ -121,6 +121,11 @@ SkyRadar away from the UK still has aerodromes, navaids and airspace:
 | [openAIP](https://www.openaip.net) daily exports | airports, navaids, VFR reporting points, airspace | CC BY-NC 4.0 |
 | [OurAirports](https://ourairports.com) | aerodrome positions openAIP does not list | public domain |
 
+Each download is tried up to three times. If openAIP or OurAirports still gives
+nothing (and nothing usable is cached), the build stops with a non-zero exit
+before any ZIP is written or uploaded. Pass `--no-base` to build the UK data
+alone on purpose.
+
 - `navaid.dat` gets the openAIP navaids the eAIP does not have. Idents repeat
   around the world, so a navaid only counts as already present when the ident
   matches and it is within 10 NM.

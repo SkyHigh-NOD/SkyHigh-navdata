@@ -238,6 +238,14 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     html_dir = out_dir / "airac" / "html"
     nav_wanted = sorted(only & set(NAV_ITEMS))
 
+    # The seed already holds the base rows of the build that made it. When
+    # this run merges again they come out first, so the merge starts from the
+    # SkyHigh rows and openAIP still beats OurAirports for every aerodrome.
+    override_paths = [relative for relative, _source in pack.iter_overrides(OVERRIDES_DIR)]
+    need_nav_merge = bool(nav_wanted) or bool(MERGE_TARGETS & set(override_paths))
+    if need_nav_merge:
+        merge.strip_base_rows(stage_dir, seed_manifest, region=region, log=progress.log)
+
     # 2) eAIP HTML availability -------------------------------------------------
     if "download" in only:
         progress.advance(0.1, "re-downloading NATS eAIP")
@@ -288,8 +296,6 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     # The overrides are copied in before the merge (step 6), as in
     # build_navdata.py. An override of a merged nav file replaces the seed's
     # copy, base rows included, so the merge has to run again after it.
-    override_paths = [relative for relative, _source in pack.iter_overrides(OVERRIDES_DIR)]
-    need_nav_merge = bool(nav_wanted) or bool(MERGE_TARGETS & set(override_paths))
     base_data = None
     openaip_airspace = "airspace" in only and args.airspace_source != "eaip"
     if openaip_airspace or "layouts" in only or need_nav_merge:
@@ -298,9 +304,9 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
             Path(args.cache_dir), log=None,
             progress_cb=lambda done, total, label:
                 progress.advance(done / max(total, 1), label))
-        base_data = dict(openaip)
         progress.step("OurAirports CSV", "")
-        base_data["ourairports"] = base.load_ourairports(Path(args.cache_dir), log=progress.log)
+        base_data = base.require_base(
+            openaip, base.load_ourairports(Path(args.cache_dir), log=progress.log))
     else:
         progress.skip("openAIP global exports", "not needed")
         progress.skip("OurAirports CSV", "not needed")
@@ -632,31 +638,63 @@ def release_asset_names(tag: str):
     return [name for name in view.stdout.splitlines() if name.strip()]
 
 
+def combined_asset_names(cycle_code: str) -> set:
+    """Both names the combined navdata can be published under for a cycle.
+
+    SkyRadar takes ``EG_<cycle>.zip`` when the release has it and
+    ``<cycle>.zip`` otherwise, so a release must never hold the two at once:
+    the one that is not being replaced would be stale, and may be the one
+    that gets installed.
+    """
+    return {pack.asset_name(REGION, cycle_code), "%s.zip" % cycle_code}
+
+
 def publish(zips: list, cycle_code: str, cycle_display: str, log,
             clobber: bool = False, update_notes: bool = True) -> None:
     """Upload the ZIPs to the cycle's GitHub release.
 
     Assets already on the release are left alone and the upload is refused
-    unless ``clobber`` is set. ``update_notes`` is off when only some of the
-    release's assets are being uploaded, so its notes keep listing all of them.
+    unless ``clobber`` is set. The combined navdata under its other name
+    (``<cycle>.zip`` against ``EG_<cycle>.zip``) counts as already there:
+    with ``clobber`` it is deleted once the new one is up. ``update_notes`` is
+    off when only some of the release's assets are being uploaded, so its
+    notes keep listing all of them.
     """
     tag = "airac-%s" % cycle_code
     title = "AIRAC %s - SkyHigh navdata" % cycle_display
     if not zips:
         raise RuntimeError("No release ZIPs found")
     zips = [Path(z) for z in zips]
+    names = {z.name for z in zips}
+    combined = combined_asset_names(cycle_code)
+    if len(names & combined) > 1:
+        raise RuntimeError(
+            "Both %s would be uploaded. A release holds the combined navdata under "
+            "one name only." % " and ".join(sorted(names & combined)))
     existing = release_asset_names(tag)
     if existing is not None:
-        taken = sorted(set(existing) & {z.name for z in zips})
-        if taken and not clobber:
+        taken = sorted(set(existing) & names)
+        # the combined navdata under the name this run does not upload
+        obsolete = sorted((combined - names) & set(existing)) if names & combined else []
+        if (taken or obsolete) and not clobber:
             raise RuntimeError(
                 "Release %s already has %s. Nothing was uploaded; pass --clobber to "
-                "replace the live asset(s)." % (tag, ", ".join(taken)))
+                "replace the live asset(s)%s." % (
+                    tag, ", ".join(taken + obsolete),
+                    " and delete %s" % ", ".join(obsolete) if obsolete else ""))
         log("Release %s exists - uploading %d asset(s)%s"
             % (tag, len(zips), " (replacing %d)" % len(taken) if taken else ""))
         extra = ["--clobber"] if clobber else []
         for batch in _chunks([str(z) for z in zips], 20):
             _gh("release", "upload", tag, "--repo", NAVDATA_REPO, *extra, *batch)
+        # After the upload, so the release is never without the combined navdata.
+        for name in obsolete:
+            _gh("release", "delete-asset", tag, name, "--repo", NAVDATA_REPO, "--yes")
+            log("Deleted %s from the release (replaced by %s)"
+                % (name, ", ".join(sorted(names & combined))))
+        if obsolete and not update_notes:
+            log("The release notes still name %s; edit them on the release."
+                % ", ".join(obsolete))
         if update_notes:
             notes = write_master_notes(zips[0].parent, cycle_display, cycle_code, zips)
             _gh("release", "edit", tag, "--repo", NAVDATA_REPO,
@@ -814,8 +852,9 @@ def main(argv=None) -> int:
                     progress.advance(done / max(total, 1), label))
             progress.step("OurAirports CSV", "")
             ourairports = base.load_ourairports(Path(args.cache_dir), log=progress.log)
-            base_data = dict(openaip)
-            base_data["ourairports"] = ourairports
+            # Raises when either source came back empty: nothing is packaged
+            # or published from a build that is missing the base it asked for.
+            base_data = base.require_base(openaip, ourairports)
             counts.update(ourairports.get("counts", {}))
             counts.update(openaip.get("counts", {}))
 

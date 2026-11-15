@@ -276,6 +276,8 @@ _COUNT_LABELS = {
     "base_vfr_points": "openAIP VFR reporting points",
     "base_navaids": "openAIP navaids added",
     "base_aerodromes": "Base aerodrome positions added",
+    "base_rows_navaids": "Base rows at the end of navaid.dat",
+    "base_rows_aerodromes": "Base rows at the end of AD-positions",
     "airspace_drawings": "openAIP airspace drawings",
     "overrides": "Local CONFIG overrides",
 }
