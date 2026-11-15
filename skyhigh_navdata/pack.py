@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,9 +46,43 @@ def display_path(path) -> str:
     return path.name or "."
 
 
+# A quoted absolute path, which may hold spaces: the quotes say where it ends.
+_QUOTED_PATH_RE = re.compile(r"""(['"])((?:[A-Za-z]:[\\/]|\\\\|/)[^'"\n]*)\1""")
+
+
+def _private_roots() -> list:
+    """Folders whose location must not show: longest first, in both slash forms."""
+    found = set()
+    for get in (Path.home, Path.cwd, lambda: REPO_ROOT, lambda: Path(tempfile.gettempdir())):
+        try:
+            root = get()
+            for form in (str(root), root.as_posix(), str(root.resolve()), root.resolve().as_posix()):
+                if len(form) > 3:
+                    found.add(form)
+        except (OSError, RuntimeError):
+            continue
+    return sorted(found, key=len, reverse=True)
+
+
 def scrub_paths(text) -> str:
-    """``text`` with every absolute path in it cut down to its base name."""
-    return _ABSOLUTE_PATH_RE.sub(lambda match: match.group(1) or "(folder)", str(text))
+    """``text`` with every absolute path in it cut down to its base name.
+
+    Three passes, because a path with a space in it has no end a pattern can
+    find: quoted paths first, then anything under a folder this tool knows
+    (home, working directory, repository, temp), then whatever still looks
+    like an absolute path.
+    """
+    text = str(text)
+
+    def base_name(match):
+        name = re.split(r"[\\/]+", match.group(2).rstrip("\\/"))[-1]
+        return "%s%s%s" % (match.group(1), name or "(folder)", match.group(1))
+
+    text = _QUOTED_PATH_RE.sub(base_name, text)
+    for root in _private_roots():
+        text = re.sub(re.escape(root) + r"[\\/]+", "", text, flags=re.IGNORECASE)
+        text = re.sub(re.escape(root), "(folder)", text, flags=re.IGNORECASE)
+    return _ABSOLUTE_PATH_RE.sub(lambda match: match.group(1) or "(folder)", text)
 
 
 def error_text(error) -> str:

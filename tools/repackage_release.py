@@ -67,7 +67,10 @@ def main(argv=None) -> int:
 
     source = Path(args.zip)
     out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return fail("the output folder could not be created (%s)." % pack.error_text(error))
 
     # Messages name the ZIP by its file name and say what is wrong in words.
     # Neither the folder it sits in nor an exception's own text is printed.

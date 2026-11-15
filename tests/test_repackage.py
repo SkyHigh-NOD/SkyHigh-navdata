@@ -306,3 +306,28 @@ def test_paths_in_messages_are_cut_to_the_file_name(tmp_path):
     error = FileNotFoundError(2, "No such file or directory", str(tmp_path / "gone.csv"))
     assert pack.error_text(error) == "No such file or directory: gone.csv"
     assert str(tmp_path) not in pack.error_text(RuntimeError("bad file %s" % (tmp_path / "a.zip")))
+
+
+def test_a_path_with_spaces_is_cut_whole(tmp_path, monkeypatch):
+    from skyhigh_navdata import pack
+
+    quoted = pack.error_text(RuntimeError("bad file '/Users/Jane Doe/company/cache.json'"))
+    assert quoted == "bad file 'cache.json'"
+    windows = pack.scrub_paths('cannot read "C:\\Users\\Jane Doe\\work files\\EG_2611.zip" here')
+    assert windows == 'cannot read "EG_2611.zip" here'
+    home = tmp_path / "Jane Doe"
+    home.mkdir()
+    monkeypatch.setattr(pack.Path, "home", classmethod(lambda cls: home))
+    bare = pack.scrub_paths("bad file %s" % (home / "company files" / "cache.json"))
+    assert "Jane" not in bare and "Doe" not in bare and str(tmp_path) not in bare
+
+
+def test_an_output_folder_that_is_a_file_fails_without_a_path(tmp_path, capsys):
+    blocker = tmp_path / "taken"
+    blocker.write_text("x", encoding="utf-8")
+    code = repackage_release.main([str(tmp_path / "EG_2611.zip"), "--out", str(blocker)])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "FAILED:" in captured.err
+    assert "Traceback" not in captured.err
+    assert no_private_path(captured.err + captured.out, tmp_path)
