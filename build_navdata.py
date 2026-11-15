@@ -42,7 +42,7 @@ DEFAULT_OVERRIDES_DIR = Path(__file__).resolve().parent / "CONFIG"
 def make_logger(quiet: bool = False):
     def log(message: str) -> None:
         if not quiet:
-            print(message, flush=True)
+            print(pack.scrub_paths(message), flush=True)
     return log
 
 
@@ -125,18 +125,18 @@ def resolve_sources(args, stage_dir, log):
     if args.source_dir:
         html_dir = Path(args.source_dir)
         if not html_dir.is_dir():
-            raise SystemExit("--source-dir is not a directory: %s" % html_dir)
-        log("Using pre-extracted eAIP HTML from %s" % html_dir)
+            raise SystemExit("--source-dir is not a directory: %s" % pack.display_path(html_dir))
+        log("Using pre-extracted eAIP HTML from %s" % pack.display_path(html_dir))
         cycle = requested
     elif args.airac_zip:
         archive_path = Path(args.airac_zip)
         if not archive_path.is_file():
-            raise SystemExit("--airac-zip is not a file: %s" % archive_path)
+            raise SystemExit("--airac-zip is not a file: %s" % pack.display_path(archive_path))
         html_dir = stage_dir.parent / "airac-html"
         if html_dir.exists():
             shutil.rmtree(html_dir)
         html_dir.mkdir(parents=True, exist_ok=True)
-        log("Extracting local AIRAC ZIP %s" % archive_path)
+        log("Extracting local AIRAC ZIP %s" % archive_path.name)
         with zipfile.ZipFile(archive_path) as archive:
             pack.safe_extract(archive, html_dir)
         cycle = requested
@@ -191,7 +191,8 @@ def main(argv=None) -> int:
     elif args.overrides_dir:
         overrides_dir = Path(args.overrides_dir)
         if not overrides_dir.is_dir():
-            raise SystemExit("--overrides-dir is not a directory: %s" % overrides_dir)
+            raise SystemExit("--overrides-dir is not a directory: %s"
+                             % pack.display_path(overrides_dir))
     else:
         overrides_dir = DEFAULT_OVERRIDES_DIR if DEFAULT_OVERRIDES_DIR.is_dir() else None
 
@@ -224,7 +225,8 @@ def main(argv=None) -> int:
             base_data = base.require_base(openaip, ourairports)
         except (base.BaseDataError, *base.DOWNLOAD_ERRORS) as error:
             print("FAILED: the base data could not be loaded (%s). No ZIP was built. "
-                  "Run the build again, or pass --no-base." % error, file=sys.stderr)
+                  "Run the build again, or pass --no-base." % pack.error_text(error),
+                  file=sys.stderr)
             return 1
         counts.update(ourairports.get("counts", {}))
         counts.update(openaip.get("counts", {}))
@@ -266,7 +268,7 @@ def main(argv=None) -> int:
 
     applied = []
     if overrides_dir:
-        log("Applying local overrides from %s ..." % overrides_dir)
+        log("Applying local overrides from %s ..." % pack.display_path(overrides_dir))
         applied = pack.apply_overrides(stage_dir, overrides_dir, log=log)
         counts["overrides"] = len(applied)
         # The manifest and the release notes are published. They name where
@@ -351,7 +353,7 @@ def main(argv=None) -> int:
 
     size_mb = zip_path.stat().st_size / (1024 * 1024)
     print("", flush=True)
-    print("Built %s" % zip_path, flush=True)
+    print("Built %s" % pack.display_path(zip_path), flush=True)
     print("  AIRAC cycle : %s (%s)" % (cycle_display, cycle_code), flush=True)
     print("  Files       : %d (%.2f MB)" % (len(manifest["files"]), size_mb), flush=True)
     print("  Counts      : %s" % ", ".join("%s=%s" % item for item in sorted(counts.items())), flush=True)
@@ -361,7 +363,7 @@ def main(argv=None) -> int:
         if region_zip:
             print("  Region ZIP  : %s" % region_zip.name, flush=True)
     if notes_path:
-        print("  Notes       : %s" % notes_path, flush=True)
+        print("  Notes       : %s" % pack.display_path(notes_path), flush=True)
     print("", flush=True)
     print("Next: upload this ZIP as an asset of a GitHub release (e.g. tag 'airac-%s')." % cycle_code, flush=True)
     print("SkyRadar installs the newest asset from the repo's latest release.", flush=True)

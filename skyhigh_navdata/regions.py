@@ -519,6 +519,27 @@ def copy_staged_airspace_groups(stage_bg: Path, region_bg: Path, bbox) -> int:
     return total
 
 
+EAIP_AIRSPACE = "NATS UK eAIP ENR 2.1 / AD 2.17"
+OPENAIP_AIRSPACE = "openAIP daily exports (CC BY-NC 4.0)"
+
+
+def airspace_label(bg_dir: Path) -> str:
+    """The manifest's airspace source, read off the drawings in ``CONFIG/bg``.
+
+    Every ``OAIP*.lst`` group is openAIP's and every other ``.lst`` group is
+    drawn from the eAIP, so the label credits exactly the sources whose
+    drawings the package holds, whatever an earlier manifest said.
+    """
+    bg_dir = Path(bg_dir)
+    indexes = [path.name for path in bg_dir.glob("*.lst")] if bg_dir.is_dir() else []
+    named = []
+    if any(not OPENAIP_INDEX_RE.match(name) for name in indexes):
+        named.append(EAIP_AIRSPACE)
+    if any(OPENAIP_INDEX_RE.match(name) for name in indexes):
+        named.append(OPENAIP_AIRSPACE)
+    return ", and ".join(named) if named else "none in this package"
+
+
 def _refuse_local_paths(manifest) -> None:
     leaked = pack.local_paths_in(manifest)
     if leaked:
@@ -547,8 +568,19 @@ def build_global_zip(stage_dir: Path, out_dir: Path, airac_display: str,
         sources=sources, counts=counts, generator_version=generator_version,
     )
     _refuse_local_paths(manifest)
-    pack.write_manifest(stage_dir, manifest)
-    zip_path = pack.make_zip(stage_dir, Path(out_dir) / pack.asset_name("ALL", airac_code))
+    # The staged tree belongs to the combined build. Its manifest is put back
+    # once the world ZIP is written, so a tree kept with --keep-staging still
+    # says region EG and a later --only run accepts it.
+    staged_manifest = Path(stage_dir) / pack.MANIFEST_NAME
+    combined = staged_manifest.read_bytes() if staged_manifest.is_file() else None
+    try:
+        pack.write_manifest(stage_dir, manifest)
+        zip_path = pack.make_zip(stage_dir, Path(out_dir) / pack.asset_name("ALL", airac_code))
+    finally:
+        if combined is not None:
+            staged_manifest.write_bytes(combined)
+        elif staged_manifest.exists():
+            staged_manifest.unlink()
     problems = pack.verify_zip(zip_path, manifest)
     if problems:
         raise RuntimeError("World ZIP failed verification: %s" % "; ".join(problems))
@@ -658,7 +690,9 @@ def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
 
     region_sources = dict(sources or {})
     region_sources["subset"] = "filtered from the combined build by ICAO region prefix"
-    if not counts.get("openaip_airspaces"):
+    if counts.get("openaip_airspaces"):
+        region_sources["airspace"] = airspace_label(region_bg)
+    else:
         region_sources["airspace"] = "none in this region package"
     manifest = pack.build_manifest(
         region_stage, region=prefix, airac=airac_display, airac_code=airac_code,

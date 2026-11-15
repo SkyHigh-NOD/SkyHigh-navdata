@@ -33,6 +33,8 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .pack import error_text
+
 OPENAIP_EXPORTS_URL = "https://storage.openaip.net/openaip-system-exports/"
 OPENAIP_TYPES = ("apt", "nav", "rpp", "asp")
 
@@ -146,7 +148,7 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
             raise
         if log:
             log("openAIP: WARNING - listing unavailable (%s); using %d cached export(s)"
-                % (error, len(listing)))
+                % (error_text(error), len(listing)))
 
     airports: dict = {}
     navaids: dict = {}
@@ -169,7 +171,7 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
                 # The stamp is not recorded, so the next build asks again. An
                 # older copy on disk is still parsed below.
                 if log:
-                    log("openAIP: WARNING - %s download failed (%s)" % (key, error))
+                    log("openAIP: WARNING - %s download failed (%s)" % (key, error_text(error)))
                 if not path.is_file():
                     continue
             else:
@@ -489,7 +491,7 @@ def load_ourairports(cache_dir: Path, log=None) -> dict:
             sha = str(commits[0].get("sha") or "")
     except (*DOWNLOAD_ERRORS, ValueError) as error:
         if log:
-            log("OurAirports: WARNING - could not check the latest revision (%s)" % error)
+            log("OurAirports: WARNING - could not check the latest revision (%s)" % error_text(error))
     csv_path = cache_dir / "ourairports.csv"
     failure = ""
     if sha and sha == cached_sha and csv_path.is_file():
@@ -512,9 +514,9 @@ def load_ourairports(cache_dir: Path, log=None) -> dict:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 cache_path.write_text(json.dumps({"sha": sha}) + "\n", encoding="utf-8")
         except DOWNLOAD_ERRORS as error:
-            failure = str(error)
+            failure = error_text(error)
             if log:
-                log("OurAirports: WARNING - download failed (%s)" % error)
+                log("OurAirports: WARNING - download failed (%s)" % failure)
     elif log:
         log("OurAirports: using the cached CSV")
 

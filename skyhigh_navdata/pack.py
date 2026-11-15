@@ -18,6 +18,51 @@ SCHEMA_VERSION = 1
 # with the installer in skyradar/gui/dialogs/airac_update.py.
 ALLOWED_PREFIXES = ("CONFIG/nav/", "CONFIG/ad/", "CONFIG/bg/")
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# An absolute path inside a message: a drive or UNC path, or one from the
+# root. A URL and a relative path (dist/EG_2611.zip) do not match.
+_ABSOLUTE_PATH_RE = re.compile(
+    r"""(?<![\w:/.\\-])(?:[A-Za-z]:[\\/]|\\\\|/)(?:[^\s'"<>|*?\\/]+[\\/]+)+([^\s'"<>|*?\\/]*)""")
+
+
+def display_path(path) -> str:
+    """A path as a message may show it: never absolute.
+
+    Relative to the working directory or the repository when it is inside
+    one of them, and the base name alone otherwise. Messages end up in
+    terminals, logs and pasted bug reports; where the builder keeps its files
+    is nobody else's business.
+    """
+    path = Path(path)
+    if not path.is_absolute():
+        return path.as_posix()
+    for root in (Path.cwd(), REPO_ROOT):
+        try:
+            return path.resolve().relative_to(root.resolve()).as_posix() or "."
+        except (OSError, ValueError):
+            continue
+    return path.name or "."
+
+
+def scrub_paths(text) -> str:
+    """``text`` with every absolute path in it cut down to its base name."""
+    return _ABSOLUTE_PATH_RE.sub(lambda match: match.group(1) or "(folder)", str(text))
+
+
+def error_text(error) -> str:
+    """What went wrong, in words fit for a message: no absolute path.
+
+    An OSError names its file by the full path. Here it is the reason and the
+    file's base name; any other error has the paths in its text scrubbed.
+    """
+    reason = getattr(error, "strerror", None)
+    filename = getattr(error, "filename", None)
+    if isinstance(error, OSError) and isinstance(reason, str) and reason and filename:
+        names = [Path(str(name)).name for name in (filename, getattr(error, "filename2", None)) if name]
+        return scrub_paths("%s: %s" % (reason, " -> ".join(names)))
+    return scrub_paths(error)
+
 
 def allowed_relative_path(relative: str) -> bool:
     """True if a zip/manifest path is one the tool is allowed to create."""
@@ -111,7 +156,7 @@ def apply_overrides(stage_dir, overrides_dir, log=None) -> list:
         shutil.copyfile(source, target)
         applied.append(relative)
         if log:
-            log("Override: %s (from %s)" % (relative, source))
+            log("Override: %s" % relative)
     return applied
 
 

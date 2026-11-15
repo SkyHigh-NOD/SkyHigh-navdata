@@ -238,13 +238,8 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
     html_dir = out_dir / "airac" / "html"
     nav_wanted = sorted(only & set(NAV_ITEMS))
 
-    # The seed already holds the base rows of the build that made it. When
-    # this run merges again they come out first, so the merge starts from the
-    # SkyHigh rows and openAIP still beats OurAirports for every aerodrome.
     override_paths = [relative for relative, _source in pack.iter_overrides(OVERRIDES_DIR)]
     need_nav_merge = bool(nav_wanted) or bool(MERGE_TARGETS & set(override_paths))
-    if need_nav_merge:
-        merge.strip_base_rows(stage_dir, seed_manifest, region=region, log=progress.log)
 
     # 2) eAIP HTML availability -------------------------------------------------
     if "download" in only:
@@ -262,6 +257,20 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
         print("eAIP HTML is not cached (dist/airac/html). Add 'download' to --only.",
               file=sys.stderr)
         return 1
+
+    # From here on the staged files change. The staged manifest describes
+    # them as they were, so it goes first: if this run fails part way, the
+    # next one finds a tree without a manifest and seeds again from the ZIP
+    # instead of working on half-changed files. The new manifest is written
+    # only once everything below has succeeded.
+    if manifest_path.exists():
+        manifest_path.unlink()
+
+    # The seed already holds the base rows of the build that made it. When
+    # this run merges again they come out first, so the merge starts from the
+    # SkyHigh rows and openAIP still beats OurAirports for every aerodrome.
+    if need_nav_merge:
+        merge.strip_base_rows(stage_dir, seed_manifest, region=region, log=progress.log)
 
     # 3) regenerate the requested nav files --------------------------------------
     progress.step("Parsing eAIP into CONFIG/nav",
@@ -382,6 +391,10 @@ def run_selective(args, progress, out_dir: Path, only: set) -> int:
         base_data, "", len(applied),
         previous=previous_sources if isinstance(previous_sources, dict) else None,
         airspace=args.airspace_source if "airspace" in only else "")
+    if "airspace" in only:
+        # what the tree holds now: eAIP drawings kept from the seed are still
+        # credited when only the openAIP groups were redrawn, and the reverse
+        sources["airspace"] = regions.airspace_label(bg_dir)
     sources["regenerated"] = ", ".join(sorted(only))
     manifest = sealed_manifest(
         stage_dir, region=region, airac=cycle_display, airac_code=cycle_code,
@@ -522,7 +535,7 @@ class Progress:
     def log(self, message: str) -> None:
         with self._lock:
             line = " " * (self._line_len + 2)
-            sys.stdout.write("\r" + line + "\r" + str(message) + "\n")
+            sys.stdout.write("\r" + line + "\r" + pack.scrub_paths(message) + "\n")
             sys.stdout.flush()
             self._render()
 
@@ -991,7 +1004,8 @@ def main(argv=None) -> int:
 
         progress.step("Done", "")
         progress.finish("done")
-        print("Done: AIRAC %s (%s) in %s" % (cycle_display, cycle_code, out_dir))
+        print("Done: AIRAC %s (%s) in %s"
+              % (cycle_display, cycle_code, pack.display_path(out_dir)))
         if not args.publish:
             print("Nothing was uploaded. Run again with --publish to upload to the release.")
         return 0
@@ -1001,7 +1015,7 @@ def main(argv=None) -> int:
         return 130
     except Exception as error:  # noqa: BLE001 - surface after closing the bar
         progress.finish("FAILED")
-        print("FAILED: %s" % error, file=sys.stderr)
+        print("FAILED: %s" % pack.error_text(error), file=sys.stderr)
         return 1
 
 

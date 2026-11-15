@@ -14,7 +14,7 @@ from urllib.error import HTTPError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from .pack import safe_extract
+from .pack import display_path, error_text, safe_extract
 
 NATS_AIP_URL = "https://nats-uk.ead-it.com/cms-nats/opencms/en/Publications/AIP/"
 GATEWAY_API_BASE = "https://gateway.x-plane.com/apiv1"
@@ -149,7 +149,7 @@ def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tu
     with zipfile.ZipFile(archive_path) as archive:
         safe_extract(archive, html_dir)
     if log:
-        log("Extracted AIRAC archive to %s" % html_dir)
+        log("Extracted AIRAC archive to %s" % display_path(html_dir))
     return cycle, html_dir
 
 
@@ -244,7 +244,7 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
                 content = archive.read(preferred)
         except zipfile.BadZipFile as error:
             if log:
-                log("Gateway download for %s scenery %s is not a valid ZIP: %s" % (icao, scenery_id, error))
+                log("Gateway download for %s scenery %s is not a valid ZIP: %s" % (icao, scenery_id, error_text(error)))
             return False
         except HTTPError as error:
             if log:
@@ -257,7 +257,7 @@ def write_gateway_layout(icao: str, output_path: Path, log=None) -> bool:
     temporary.write_bytes(content)
     os.replace(temporary, output_path)
     if log:
-        log("Wrote airport layout: %s" % output_path)
+        log("Wrote airport layout: %s" % output_path.name)
     return True
 
 
@@ -292,7 +292,7 @@ def download_all_ad_layouts(icaos, ad_dir, log=None, skip=None, progress_cb=None
             except Exception as error:  # noqa: BLE001 - keep going on individual failures
                 failed += 1
                 if log:
-                    log("Failed to download %s layout: %s" % (icao, error))
+                    log("Failed to download %s layout: %s" % (icao, error_text(error)))
             time.sleep(0.25)
         if progress_cb:
             progress_cb(index, total, icao)
