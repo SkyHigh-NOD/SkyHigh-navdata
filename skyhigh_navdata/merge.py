@@ -1,23 +1,54 @@
 """Merge the global base data *underneath* the SkyHigh-generated nav files.
 
-The staged ``CONFIG/nav`` files come out of the eAIP build (and hand-maintained
-overrides) first, so they are already on top. This module only ever **appends**
-base entries whose identity is not already present:
+The staged ``CONFIG/nav`` files come out of the eAIP build (and the
+hand-maintained overrides) first, so they are already on top. This module only
+ever **appends** base entries whose identity is not already present:
 
-    fix.dat        eAIP fixes + openAIP reporting points
     navaid.dat     eAIP navaids + openAIP navaids
     AD-positions   eAIP aerodromes + openAIP aerodromes + OurAirports
 
-Precedence therefore falls out of the insertion order: SkyHigh > openAIP >
-OurAirports — "whichever is most up to date goes on top" without any compare
-logic at read time.
+Precedence falls out of the insertion order: SkyHigh > openAIP > OurAirports.
+
+``fix.dat`` is left alone. It is the file IFR routes resolve against and its
+rows are ``lat lon NAME`` split on whitespace; openAIP's reporting points are
+VFR points whose names contain spaces and repeat between aerodromes. They go
+to their own file, ``CONFIG/nav/vfr-points``.
 """
 from __future__ import annotations
 
+import math
+import os
 import re
 from pathlib import Path
 
 AD_POSITION_LINE_RE = re.compile(r"^([A-Z0-9]{4}) (-?\d+\.\d+),(-?\d+\.\d+) (.+)$")
+ICAO_RE = re.compile(r"^[A-Z]{4}$")
+FIX_NAME_RE = re.compile(r"^[A-Z0-9]+$")
+
+# Two navaids with one ident are the same navaid when they sit this close.
+SAME_NAVAID_NM = 10.0
+
+VFR_POINTS_NAME = "vfr-points"
+NOTICE_NAME = "NOTICE.txt"
+
+NOTICE_TEXT = """\
+This package contains data from third parties.
+
+openAIP (https://www.openaip.net)
+  Airports, navaids, VFR reporting points and airspace from the openAIP
+  daily exports. Licensed CC BY-NC 4.0
+  (https://creativecommons.org/licenses/by-nc/4.0/). Non-commercial use only;
+  keep this credit with the data.
+
+OurAirports (https://ourairports.com)
+  Aerodrome positions. Public domain.
+
+NATS UK eAIP (https://nats-uk.ead-it.com)
+  UK navaids, fixes, airways, aerodromes and airspace.
+
+X-Plane Scenery Gateway (https://gateway.x-plane.com)
+  Airport layouts in CONFIG/ad.
+"""
 
 
 def _read_lines(path: Path) -> list[str]:
@@ -27,94 +58,101 @@ def _read_lines(path: Path) -> list[str]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    import os
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(text, encoding="utf-8")
     os.replace(temporary, path)
 
 
-def _fallback_fix_rows() -> list[str]:
-    """Worldwide fixes from the bundled X-Plane earth-fix.dat (Robin A. Peel's
-    navdata, GPL v2+ — the header inside states the licence). This is the
-    lowest-precedence layer under the eAIP fixes and openAIP reporting points,
-    which alone cover mostly Europe."""
-    path = Path(__file__).resolve().parent / "resources" / "earth-fix.dat"
+def _one_line(text) -> str:
+    """Text with every run of whitespace, tabs and newlines included, as one space."""
+    return " ".join(str(text or "").split())
+
+
+def distance_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in nautical miles."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 3440.065 * 2 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def navaid_row(nav: dict) -> str:
+    """One navaid.dat row for a base navaid. The elevation is always a number."""
+    ident = str(nav["ident"]).upper()
+    elevation = nav.get("elev_ft")
+    if not isinstance(elevation, (int, float)) or isinstance(elevation, bool):
+        elevation = 0
+    return "%s %.6f %.6f %d %s 0 0 %s 0 %s %s" % (
+        nav.get("type", 2), nav["lat"], nav["lon"], int(round(elevation)),
+        nav.get("freq") or "0", ident, nav.get("region") or "XX",
+        _one_line(nav.get("name")) or ident,
+    )
+
+
+def write_vfr_points(nav_dir: Path, base: dict, log=None) -> int:
+    """Write openAIP's VFR reporting points to ``CONFIG/nav/vfr-points``.
+
+    One point per line, tab-separated: latitude, longitude, ISO country, name.
+    The name is the last field, so it may hold spaces. Nothing is written when
+    there are no points; a file from an earlier run is removed in that case.
+    """
+    path = Path(nav_dir) / VFR_POINTS_NAME
+    points = base.get("vfr_points") or {}
     rows = []
-    try:
-        for line in path.read_text(encoding="ascii", errors="replace").splitlines():
-            parts = line.split()
-            if len(parts) == 3 and re.match(r"^-?\d+(?:\.\d+)?$", parts[0]) \
-                    and re.match(r"^-?\d+(?:\.\d+)?$", parts[1]):
-                rows.append(line.strip())
-    except OSError:
-        pass
-    return rows
-
-
-def merge_fixes(nav_dir: Path, base: dict, log=None) -> tuple[int, int]:
-    """Append base fixes to fix.dat (plain lat lon name rows).
-
-    Precedence is insertion order: the eAIP fixes are already in the file, so
-    openAIP reporting points are appended first and the bundled worldwide
-    X-Plane fix set last — names already present are never duplicated.
-    Returns (openaip_added, fallback_added)."""
-    existing = set()
-    lines = _read_lines(Path(nav_dir) / "fix.dat")
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 3:
-            existing.add(parts[2].upper())
-    added = []
-    for name, (lat, lon) in sorted(base.get("fixes", {}).items()):
-        if name in existing:
-            continue
-        existing.add(name)
-        added.append("%.6f %.6f %s" % (lat, lon, name))
-    openaip_added = len(added)
-    fallback_added = 0
-    for row in _fallback_fix_rows():
-        parts = row.split()
-        if parts[2].upper() in existing:
-            continue
-        existing.add(parts[2].upper())
-        added.append(row)
-        fallback_added += 1
-    if added:
-        _atomic_write_text(
-            Path(nav_dir) / "fix.dat",
-            "\n".join(lines + added) + "\n",
-        )
+    for key, (lat, lon) in sorted(points.items()):
+        country, name = key[0], key[1]
+        rows.append("%.6f\t%.6f\t%s\t%s" % (lat, lon, country or "XX", _one_line(name)))
+    if not rows:
+        if path.exists():
+            path.unlink()
+        return 0
+    header = [
+        "# VFR reporting points from the openAIP daily exports (CC BY-NC 4.0).",
+        "# latitude<TAB>longitude<TAB>ISO country<TAB>name",
+    ]
+    _atomic_write_text(path, "\n".join(header + rows) + "\n")
     if log:
-        log("fixes: +%d openAIP reporting point(s), +%d worldwide fallback"
-            % (openaip_added, fallback_added))
-    return openaip_added, fallback_added
+        log("vfr points: %d openAIP reporting point(s)" % len(rows))
+    return len(rows)
 
 
 def merge_navaids(nav_dir: Path, base: dict, log=None) -> int:
-    """Append openAIP navaids to navaid.dat (rows before the trailing 99)."""
+    """Append openAIP navaids to navaid.dat (rows before the trailing 99).
+
+    Idents repeat around the world, so a base navaid is only a duplicate of a
+    row already in the file when the ident matches *and* the two are within
+    ``SAME_NAVAID_NM`` of each other. The eAIP's ``LON`` keeps its place and a
+    navaid with the same ident on another continent is still added.
+    """
     path = Path(nav_dir) / "navaid.dat"
     lines = _read_lines(path)
     if not lines:
         return 0
-    existing = set()
+    placed: dict = {}
     for line in lines:
         parts = line.split()
         if len(parts) >= 11:
-            existing.add(parts[7].upper())
+            try:
+                placed.setdefault(parts[7].upper(), []).append((float(parts[1]), float(parts[2])))
+            except ValueError:
+                continue
     added = []
-    for ident, nav in sorted(base.get("navaids", {}).items()):
-        if ident in existing:
+    for _key, nav in sorted((base.get("navaids") or {}).items()):
+        ident = str(nav.get("ident") or "").upper()
+        if not ident or not FIX_NAME_RE.match(ident):
             continue
-        existing.add(ident)
-        added.append(
-            "%s %.6f %.6f %s %s 0 0 %s 0 %s %s" % (
-                nav.get("type", 2), nav["lat"], nav["lon"], nav.get("elev_ft", 0),
-                nav.get("freq", "0"), ident, nav.get("region", "XX"), nav.get("name", ident),
-            )
-        )
+        try:
+            lat, lon = float(nav["lat"]), float(nav["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if any(distance_nm(lat, lon, other_lat, other_lon) <= SAME_NAVAID_NM
+               for other_lat, other_lon in placed.get(ident, ())):
+            continue
+        placed.setdefault(ident, []).append((lat, lon))
+        added.append(navaid_row(dict(nav, ident=ident, lat=lat, lon=lon)))
     if added:
-        # rows go before the trailing "99" terminator
         write_lines = list(lines)
         if write_lines and write_lines[-1].strip() == "99":
             write_lines = write_lines[:-1] + added + ["99"]
@@ -129,7 +167,8 @@ def merge_navaids(nav_dir: Path, base: dict, log=None) -> int:
 def merge_aerodromes(nav_dir: Path, base: dict, log=None) -> int:
     """Append openAIP + OurAirports aerodromes to AD-positions.
 
-    The file ends with a record-count line that is rewritten.
+    Only four-letter ICAO codes are added. The file ends with a record-count
+    line that is rewritten.
     """
     path = Path(nav_dir) / "AD-positions"
     lines = _read_lines(path)
@@ -142,18 +181,15 @@ def merge_aerodromes(nav_dir: Path, base: dict, log=None) -> int:
         existing.add(match.group(1))
         records.append(line.rstrip())
     added = 0
-    for icao, entry in sorted(base.get("airports", {}).items()):
-        if icao in existing:
-            continue
-        existing.add(icao)
-        records.append("%s %.6f,%.6f %s" % (icao, entry["lat"], entry["lon"], entry["name"]))
-        added += 1
-    for icao, entry in sorted((base.get("ourairports") or {}).get("airports", {}).items()):
-        if icao in existing:
-            continue
-        existing.add(icao)
-        records.append("%s %.6f,%.6f %s" % (icao, entry["lat"], entry["lon"], entry["name"]))
-        added += 1
+    layers = (base.get("airports") or {}, (base.get("ourairports") or {}).get("airports") or {})
+    for layer in layers:
+        for icao, entry in sorted(layer.items()):
+            if not ICAO_RE.match(str(icao)) or icao in existing:
+                continue
+            existing.add(icao)
+            records.append("%s %.6f,%.6f %s" % (
+                icao, entry["lat"], entry["lon"], _one_line(entry.get("name")) or icao))
+            added += 1
     if records:
         _atomic_write_text(path, "\n".join(records + [str(len(records))]) + "\n")
     if log:
@@ -161,16 +197,22 @@ def merge_aerodromes(nav_dir: Path, base: dict, log=None) -> int:
     return added
 
 
+def write_notice(stage_dir: Path) -> Path:
+    """Write the third-party credits into the package (``CONFIG/nav/NOTICE.txt``)."""
+    path = Path(stage_dir) / "CONFIG" / "nav" / NOTICE_NAME
+    _atomic_write_text(path, NOTICE_TEXT)
+    return path
+
+
 def merge_base_into_stage(stage_dir: Path, base: dict, log=None) -> dict:
     """Apply all base merges to a staged CONFIG tree. Returns counts."""
     nav_dir = Path(stage_dir) / "CONFIG" / "nav"
-    openaip_fixes, fallback_fixes = merge_fixes(nav_dir, base, log)
     counts = {
-        "base_fixes": openaip_fixes,
-        "base_fallback_fixes": fallback_fixes,
+        "base_vfr_points": write_vfr_points(nav_dir, base, log),
         "base_navaids": merge_navaids(nav_dir, base, log),
         "base_aerodromes": merge_aerodromes(nav_dir, base, log),
     }
+    write_notice(stage_dir)
     if log:
         log("base merge: %s" % ", ".join("%s=%d" % item for item in counts.items()))
     return counts

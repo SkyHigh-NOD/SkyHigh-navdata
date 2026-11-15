@@ -29,6 +29,19 @@ def allowed_relative_path(relative: str) -> bool:
     return relative.startswith(ALLOWED_PREFIXES)
 
 
+def safe_extract(archive: zipfile.ZipFile, dest_dir) -> None:
+    """Extract an archive, refusing any member that would land outside ``dest_dir``."""
+    dest_dir = Path(dest_dir)
+    root = dest_dir.resolve()
+    for member in archive.infolist():
+        name = member.filename.replace("\\", "/")
+        target = (root / name).resolve()
+        if name.startswith("/") or (len(name) > 1 and name[1] == ":") \
+                or ".." in name.split("/") or (target != root and root not in target.parents):
+            raise ValueError("archive member escapes the extraction folder: %r" % member.filename)
+    archive.extractall(dest_dir)
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -260,6 +273,10 @@ _COUNT_LABELS = {
     "layouts_custom": "Local layout overrides",
     "layouts_unavailable": "Layouts unavailable",
     "layouts_failed": "Layouts failed",
+    "base_vfr_points": "openAIP VFR reporting points",
+    "base_navaids": "openAIP navaids added",
+    "base_aerodromes": "Base aerodrome positions added",
+    "airspace_drawings": "openAIP airspace drawings",
     "overrides": "Local CONFIG overrides",
 }
 

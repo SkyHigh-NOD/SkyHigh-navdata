@@ -17,9 +17,13 @@ Every subset is a bounding box and deliberately errs on the generous side;
 point data (fixes, navaids, aerodromes, entry/exit points, airway segments,
 airport layouts) is filtered per record.
 
-Airspace drawings come from the openAIP exports: the eAIP-generated airspace
-is currently broken, so openAIP *replaces* it entirely. If the eAIP airspace
-parser is ever fixed, this is the place to layer SkyHigh data back on top.
+Airspace comes from two sources and a default build ships both, because the
+two readers want different ones: skymaps' chart build reads the eAIP drawings
+(``CONFIG/bg/ENR21``), and SkyRadar reads the openAIP per-country groups
+(``CONFIG/bg/OAIP<ISO>.lst``) with ``CONFIG/bg/OAIP-countries`` to pick the
+group for a position. ``--airspace-source`` narrows that to one of them, and
+the choice applies to every ZIP the build writes. The eAIP covers the UK
+only, so a region ZIP elsewhere carries openAIP drawings or none.
 """
 from __future__ import annotations
 
@@ -45,6 +49,7 @@ WORLD_BBOX = (-90.0, -180.0, 90.0, 180.0)
 SINGLE_LETTER_REGIONS = {"K", "C", "Y"}
 
 AD_POSITION_RE = re.compile(r"^([A-Z0-9]{4}) (-?\d+\.\d+),(-?\d+\.\d+)")
+ICAO_RE = re.compile(r"^[A-Z]{4}$")
 
 
 def in_bbox(bbox, lat: float, lon: float) -> bool:
@@ -65,6 +70,9 @@ def resolve_regions(spec: str | None, stage_dir: Path, min_airports: int) -> lis
     if spec is None or spec.strip().lower() in ("auto", "all", "*", ""):
         counts: dict = {}
         for icao in _staged_region_airports(stage_dir):
+            # A local ident such as 00AK is not an ICAO code and has no region.
+            if not ICAO_RE.match(icao):
+                continue
             counts[region_prefix(icao)] = counts.get(region_prefix(icao), 0) + 1
         return [p for p, n in sorted(counts.items())
                 if n >= min_airports and p != REGION]
@@ -175,8 +183,46 @@ def _filter_ad_positions(source: Path, target: Path, bbox, prefix=None) -> tuple
     return kept, icaos
 
 
-def _filter_airways(source: Path, target: Path, fix_points: dict) -> int:
-    """Keep segments whose two endpoints are both inside the fix set."""
+def _parse_navaid_idents(path: Path) -> set:
+    """navaid.dat -> the idents in it."""
+    idents = set()
+    if not path.is_file():
+        return idents
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 11:
+            idents.add(parts[7].upper())
+    return idents
+
+
+def _filter_vfr_points(source: Path, target: Path, bbox) -> int:
+    """vfr-points rows (tab-separated lat, lon, country, name) inside the box."""
+    kept = 0
+    lines = []
+    for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("#") or not line.strip():
+            lines.append(line)
+            continue
+        parts = line.split("\t")
+        try:
+            if not in_bbox(bbox, float(parts[0]), float(parts[1])):
+                continue
+        except (IndexError, ValueError):
+            continue
+        lines.append(line)
+        kept += 1
+    if kept:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return kept
+
+
+def _filter_airways(source: Path, target: Path, fix_points) -> int:
+    """Keep segments whose two endpoints are both retained in the region.
+
+    ``fix_points`` is any container of endpoint names: the region's fixes and
+    its navaids, since an airway can start or end on either.
+    """
     kept = 0
     lines = []
     for line in source.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -227,29 +273,85 @@ def _family_keys(name: str) -> set:
     return keys
 
 
-def write_world_airspace_groups(bg_dir: Path, airspaces: list, airac_cycle: str) -> int:
-    """Every openAIP airspace, bucketed into per-country .lst groups
+def write_country_airspace_groups(bg_dir: Path, airspaces: list, bbox, airac_cycle: str,
+                                  countries=None) -> int:
+    """openAIP airspace touching ``bbox``, bucketed into per-country .lst groups
     (``OAIP<ISO>`` — letters/digits only, as SkyRadar's launcher requires).
 
-    Returns the total drawing count. Countries with no drawing are skipped.
+    This is the layout SkyRadar reads. ``countries`` optionally restricts the
+    ISO codes. Returns the total drawing count; a country with no drawing in
+    the box gets no group.
     """
-    # The per-country layout replaces the older flat EG-scope group entirely;
-    # a stale OAIP.lst would reference a folder that no longer exists.
-    for stale in (bg_dir / "OAIP.lst", bg_dir / "OAIP"):
-        if stale.is_dir():
-            shutil.rmtree(stale, ignore_errors=True)
-        elif stale.exists():
-            stale.unlink()
     by_country: dict = {}
     for airspace in airspaces:
-        by_country.setdefault(airspace.get("country") or "XX", []).append(airspace)
+        country = str(airspace.get("country") or "").upper()
+        if not re.match(r"^[A-Z]{2}$", country):
+            country = "XX"
+        if countries and country not in countries:
+            continue
+        by_country.setdefault(country, []).append(airspace)
     total = 0
     for country in sorted(by_country):
         added, _group = write_openaip_airspace_group(
-            bg_dir, by_country[country], WORLD_BBOX, airac_cycle,
-            group="OAIP" + country)
+            bg_dir, by_country[country], bbox, airac_cycle, group="OAIP" + country)
         total += added
     return total
+
+
+def write_world_airspace_groups(bg_dir: Path, airspaces: list, airac_cycle: str) -> int:
+    """Every openAIP airspace as per-country groups, replacing any earlier ones."""
+    # Every earlier openAIP group goes first: the flat one, and the
+    # per-country ones, so a country that no longer has drawings keeps none.
+    clear_openaip_groups(bg_dir)
+    return write_country_airspace_groups(bg_dir, airspaces, WORLD_BBOX, airac_cycle)
+
+
+def write_openaip_airspace(bg_dir: Path, base_data: dict, scope: str, airac_cycle: str,
+                           log=None) -> int:
+    """Draw the openAIP airspace for a combined build, replacing earlier groups.
+
+    ``scope`` is ``world`` (every country) or ``eg`` (the UK and Ireland
+    only). Both write per-country ``OAIP<ISO>`` groups and the
+    ``OAIP-countries`` map, which is what SkyRadar reads.
+    """
+    bg_dir = Path(bg_dir)
+    clear_openaip_groups(bg_dir)
+    airspaces = base_data.get("airspaces") or []
+    if scope == "eg":
+        added = write_country_airspace_groups(
+            bg_dir, airspaces, EG_REGION["bbox"], airac_cycle,
+            countries=EG_REGION["countries"])
+    else:
+        added = write_country_airspace_groups(bg_dir, airspaces, WORLD_BBOX, airac_cycle)
+    mapped = 0
+    if added and base_data.get("ourairports"):
+        mapped = write_icao_country_map(bg_dir, base_data["ourairports"])
+    if log:
+        log("airspace: %d openAIP drawing(s) in per-country groups (%s scope), "
+            "%d ICAO prefix(es) mapped" % (added, scope, mapped))
+    return added
+
+
+def clear_openaip_groups(bg_dir: Path) -> int:
+    """Remove every openAIP airspace group from ``CONFIG/bg``.
+
+    That is ``OAIP.lst`` and ``OAIP/`` (the flat UK and Ireland group), each
+    ``OAIP<ISO>.lst`` and ``OAIP<ISO>/`` (the per-country groups) and the
+    ``OAIP-countries`` map. Returns how many entries were removed.
+    """
+    bg_dir = Path(bg_dir)
+    if not bg_dir.is_dir():
+        return 0
+    removed = 0
+    for entry in sorted(bg_dir.iterdir()):
+        if not re.match(r"^OAIP([A-Z]{2})?(\.lst)?$|^OAIP-countries$", entry.name):
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            entry.unlink()
+        removed += 1
+    return removed
 
 
 def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
@@ -261,11 +363,16 @@ def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
     Returns the number of prefixes written.
     """
     from collections import Counter
+    # Takes what load_ourairports returns ({"airports": {...}, "counts": {...}})
+    # or the aerodrome dict itself.
+    airports = ourairports or {}
+    if isinstance(airports.get("airports"), dict):
+        airports = airports["airports"]
     by_prefix: dict = {}
-    for icao, record in (ourairports or {}).items():
-        if not isinstance(icao, str) or len(icao) < 4:
+    for icao, record in airports.items():
+        if not isinstance(icao, str) or not ICAO_RE.match(icao) or not isinstance(record, dict):
             continue
-        country = str((record or {}).get("country") or "").upper()
+        country = str(record.get("country") or "").upper()
         if not re.match(r"^[A-Z]{2}$", country):
             continue
         by_prefix.setdefault(region_prefix(icao), Counter())[country] += 1
@@ -276,6 +383,7 @@ def write_icao_country_map(bg_dir: Path, ourairports: dict) -> int:
     if not lines:
         return 0
     out = Path(bg_dir) / "OAIP-countries"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         "# ICAO region prefix -> openAIP ISO country (majority of aerodromes).\n"
         "# Read by SkyRadar to pick the OAIP<ISO>.lst airspace group for a\n"
@@ -297,7 +405,9 @@ def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycl
     group_dir = bg_dir / group
     index = []
     count = 0
-    seen_stems = set()
+    # slug -> the volumes already written under it (limits and rings)
+    seen_stems: dict = {}
+    used_stems: set = set()
     for airspace in airspaces:
         if countries and airspace.get("country") not in countries:
             continue
@@ -319,10 +429,20 @@ def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycl
         if not (airspace_bbox[0] <= bbox[2] and bbox[0] <= airspace_bbox[2]
                 and airspace_bbox[1] <= bbox[3] and bbox[1] <= airspace_bbox[3]):
             continue
-        stem = airspace_slug(airspace["name"])
-        if stem in seen_stems:
+        # Two volumes can share a name (a CTA in several parts, or the same
+        # name in two places). An exact repeat is dropped; a different volume
+        # gets a file of its own.
+        slug = airspace_slug(airspace["name"])
+        volume = (airspace.get("upper"), airspace.get("lower"), airspace.get("rings"))
+        written = seen_stems.setdefault(slug, [])
+        if volume in written:
             continue
-        seen_stems.add(stem)
+        written.append(volume)
+        stem, serial = slug, 1
+        while stem in used_stems:
+            serial += 1
+            stem = "%s-%d" % (slug, serial)
+        used_stems.add(stem)
         filename = "%s.draw" % stem
         header = [airspace["name"]]
         if airspace.get("upper"):
@@ -340,11 +460,19 @@ def write_openaip_airspace_group(bg_dir: Path, airspaces: list, bbox, airac_cycl
     return count, group
 
 
+def _refuse_local_paths(manifest) -> None:
+    leaked = pack.local_paths_in(manifest)
+    if leaked:
+        raise RuntimeError(
+            "The manifest would publish a path from this machine (%s). "
+            "Describe the source in words instead." % ", ".join(leaked))
+
+
 # --- The world ZIP (skymaps) -------------------------------------------------
 
 def build_global_zip(stage_dir: Path, out_dir: Path, airac_display: str,
                      airac_code: str, generator_version="",
-                     notes_out=None, log=None) -> Path:
+                     notes_out=None, log=None, sources=None, counts=None) -> Path:
     """Package the fully merged staging tree as ALL_<airac>.zip.
 
     The tree is exactly the combined build's content (global nav base merged
@@ -357,8 +485,9 @@ def build_global_zip(stage_dir: Path, out_dir: Path, airac_display: str,
 
     manifest = pack.build_manifest(
         stage_dir, region="ALL", airac=airac_display, airac_code=airac_code,
-        generator_version=generator_version,
+        sources=sources, counts=counts, generator_version=generator_version,
     )
+    _refuse_local_paths(manifest)
     pack.write_manifest(stage_dir, manifest)
     zip_path = pack.make_zip(stage_dir, Path(out_dir) / pack.asset_name("ALL", airac_code))
     problems = pack.verify_zip(zip_path, manifest)
@@ -375,8 +504,16 @@ def build_global_zip(stage_dir: Path, out_dir: Path, airac_display: str,
 
 def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
                      airac_display: str, airac_code: str, base_airspaces=None,
-                     generator_version="", log=None) -> Path | None:
-    """Package one ICAO region's subset of the staged tree as <prefix>_<airac>.zip."""
+                     generator_version="", log=None, sources=None) -> Path | None:
+    """Package one ICAO region's subset of the staged tree as <prefix>_<airac>.zip.
+
+    ``base_airspaces`` is the openAIP airspace list when the build draws
+    airspace from openAIP, and None when it does not (eAIP airspace only, or
+    airspace skipped): the region then ships without drawings. They are
+    written as the per-country groups SkyRadar reads, with the combined
+    build's ``OAIP-countries`` map. ``sources`` is the combined build's source
+    list, carried into the region's manifest.
+    """
     def _log(message):
         if log:
             log(message)
@@ -417,7 +554,13 @@ def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
     _filter_ad_positions(positions_source, nav_target / "AD-positions", bbox, prefix=prefix)
     counts["aerodromes"] = len(region_icaos)
     if (nav_source / "awy.dat").is_file():
-        counts["airway_segments"] = _filter_airways(nav_source / "awy.dat", nav_target / "awy.dat", filtered_fixes)
+        endpoints = set(filtered_fixes) | _parse_navaid_idents(nav_target / "navaid.dat")
+        counts["airway_segments"] = _filter_airways(nav_source / "awy.dat", nav_target / "awy.dat", endpoints)
+    if (nav_source / "vfr-points").is_file():
+        counts["vfr_points"] = _filter_vfr_points(nav_source / "vfr-points", nav_target / "vfr-points", bbox)
+    if (nav_source / "NOTICE.txt").is_file():
+        nav_target.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(nav_source / "NOTICE.txt", nav_target / "NOTICE.txt")
     if (nav_source / "AD-entry-exit").is_file():
         counts["entry_exit_points"] = _filter_entry_exit(nav_source / "AD-entry-exit", nav_target / "AD-entry-exit", region_icaos)
     # airac.txt is regenerated per region (the staged one says region: EG)
@@ -440,15 +583,23 @@ def build_region_zip(prefix: str, stage_dir: Path, out_dir: Path,
         counts["layouts"] = layouts
 
     if base_airspaces:
-        added, _group = write_openaip_airspace_group(
-            region_stage / "CONFIG" / "bg", base_airspaces, bbox, airac_display)
+        region_bg = region_stage / "CONFIG" / "bg"
+        added = write_country_airspace_groups(region_bg, base_airspaces, bbox, airac_display)
         counts["openaip_airspaces"] = added
+        country_map = Path(stage_dir) / "CONFIG" / "bg" / "OAIP-countries"
+        if added and country_map.is_file():
+            shutil.copyfile(country_map, region_bg / "OAIP-countries")
 
+    region_sources = dict(sources or {})
+    region_sources["subset"] = "filtered from the combined build by ICAO region prefix"
+    if not counts.get("openaip_airspaces"):
+        region_sources["airspace"] = "none in this region package"
     manifest = pack.build_manifest(
         region_stage, region=prefix, airac=airac_display, airac_code=airac_code,
-        sources={"subset": "filtered from the combined build by ICAO region prefix"},
+        sources=region_sources,
         counts=counts, generator_version=generator_version,
     )
+    _refuse_local_paths(manifest)
     pack.write_manifest(region_stage, manifest)
     zip_path = pack.make_zip(region_stage, Path(out_dir) / pack.asset_name(prefix, airac_code))
     problems = pack.verify_zip(zip_path, manifest)

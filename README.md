@@ -49,18 +49,28 @@ pip install -r requirements.txt
 ### One command for a whole cycle
 
 ```
-python make_airac.py                      # build + publish the current cycle
-python make_airac.py --no-publish         # build only
+python make_airac.py                      # build the current cycle into dist/
 python make_airac.py --airac 2611         # force a cycle label
 python make_airac.py --regions LF,ED,K    # restrict per-region ZIPs
+python make_airac.py --publish            # build, then upload to the release
+python make_airac.py --publish --clobber  # ... replacing assets already there
 ```
 
 `make_airac.py` runs the whole pipeline with a live progress bar (overall
 percent, elapsed time and ETA): NATS eAIP download → CONFIG/nav parse →
-X-Plane Gateway layouts → openAIP + OurAirports global base → merge →
-combined `EG_<airac>.zip`, world `ALL_<airac>.zip` for skymaps and one ZIP
-per ICAO region → publish to the GitHub release (tag `airac-<cycle>`,
-via `gh`; requires the GitHub CLI installed and authenticated).
+openAIP + OurAirports global base → openAIP airspace → `CONFIG/` overrides →
+merge → X-Plane Gateway layouts → combined `EG_<airac>.zip`, world
+`ALL_<airac>.zip` for skymaps and one ZIP per ICAO region.
+
+**Nothing is uploaded unless `--publish` is given.** SkyRadar installs
+download from the release, so an upload changes what every install gets.
+`--publish` uploads to the release tagged `airac-<cycle>` through `gh` (the
+GitHub CLI, installed and signed in) and refuses to touch an asset that is
+already on the release; `--clobber` replaces it. Publish from a checkout of
+`main`, not from a branch under review.
+
+`make_full.py` is a menu in front of the same script. It asks before
+uploading and only `y` or `yes` uploads.
 
 ### Manual steps
 
@@ -75,28 +85,77 @@ python build_navdata.py --airac-zip AIRAC-10-26.zip
 ### Selective regeneration
 
 Don't rebuild everything for one change — regenerate just the part you need
-from the existing navdata (staged from the newest ZIP in `dist/`, or
-`--from-zip <path>`):
+from the existing navdata (staged from the newest combined ZIP in `dist/`,
+that is `EG_<airac>.zip` or `<airac>.zip`, or `--from-zip <path>`; a world or
+region ZIP is never used as the seed):
 
 ```
 python make_airac.py --only airways                     # airways only, then repackage
 python make_airac.py --only navaids,fixes               # both, plus the base re-merge
-python make_airac.py --only layouts --no-publish        # re-pull X-Plane layouts
-python make_airac.py --only airspace                    # refresh openAIP airspace
+python make_airac.py --only layouts                     # re-pull X-Plane layouts
+python make_airac.py --only airspace                    # rebuild both sets of airspace drawings
+python make_airac.py --only airspace --airspace-source openaip   # just the openAIP groups
 python make_airac.py --only download,ad-positions       # fresh eAIP + aerodrome positions
 ```
 
 Items: `download` (NATS eAIP), `fixes`, `navaids`, `airways`, `ad-positions`,
-`entry-exit`, `ctr`, `layouts` (X-Plane Gateway), `airspace` (openAIP
-drawings). The global base re-merges automatically after any nav
-regeneration, and the result is packaged under the seed ZIP's name and
-published unless `--no-publish`.
+`entry-exit`, `ctr`, `layouts` (X-Plane Gateway), `airspace` (per
+`--airspace-source`). The global base re-merges automatically after any nav
+regeneration, and the result is packaged under the seed ZIP's name. It is
+uploaded only with `--publish`, and then the release's notes are left as they
+are, since they list every asset and only one was replaced.
 
 `--airac` accepts `2610` (YYMM), `10/26`, or `202610`. When omitted it is
 detected from NATS. Useful flags: `--out dist`, `--name`, `--work-dir`,
 `--skip-layouts`, `--skip-airspace`, `--overrides-dir`, `--no-overrides`,
 `--notes-out`, `--no-notes`, `--quiet`. Run `python build_navdata.py -h` for
 everything.
+
+## Global base data
+
+The NATS eAIP covers the UK. Two more sources go in underneath it, so a
+SkyRadar away from the UK still has aerodromes, navaids and airspace:
+
+| Source | What it adds | License |
+|---|---|---|
+| [openAIP](https://www.openaip.net) daily exports | airports, navaids, VFR reporting points, airspace | CC BY-NC 4.0 |
+| [OurAirports](https://ourairports.com) | aerodrome positions openAIP does not list | public domain |
+
+- `navaid.dat` gets the openAIP navaids the eAIP does not have. Idents repeat
+  around the world, so a navaid only counts as already present when the ident
+  matches and it is within 10 NM.
+- `AD-positions` gets openAIP's aerodromes, then OurAirports'. Only four-letter
+  ICAO codes: local identifiers such as `00AK` are left out.
+- `fix.dat` is not touched. openAIP's reporting points are VFR points with
+  spaces in their names; they go to `CONFIG/nav/vfr-points` (tab-separated
+  latitude, longitude, ISO country, name).
+- `CONFIG/nav/NOTICE.txt` credits the sources and ships in every ZIP that
+  holds base data. The manifest's `sources` names them as well. openAIP's
+  license requires the credit and allows non-commercial use only.
+
+`--no-base` leaves all of it out; no world or region ZIPs are built then.
+
+Airspace drawings come from both sources by default, because the two readers
+want different ones:
+
+- the eAIP drawings, `CONFIG/bg/ENR21` and the per-aerodrome groups, which the
+  skymaps chart build reads;
+- the openAIP per-country groups, `CONFIG/bg/OAIP<ISO>.lst` (`OAIPGB`,
+  `OAIPFR`, ...) with `CONFIG/bg/OAIP-countries`, which SkyRadar reads to pick
+  the group for a position.
+
+`--airspace-source both|eaip|openaip` (default `both`) narrows that, in
+`build_navdata.py` and `make_airac.py` alike, and the choice applies to every
+ZIP the build writes. `--airspace-scope world|eg` (default `world`) limits the
+openAIP groups to the UK and Ireland. The eAIP covers the UK only, so a region
+ZIP elsewhere carries openAIP groups or no drawings.
+
+## Tests
+
+```
+pip install pytest
+python -m pytest
+```
 
 ## Customised files (local overrides)
 
@@ -120,6 +179,9 @@ CONFIG/
   generated and are never overridden.
 - Editing a file here and re-running the build is all that is needed — the
   override is picked up automatically.
+- Overrides are copied in before the base merge, in both `build_navdata.py`
+  and `make_airac.py`, so an overridden `navaid.dat` or `AD-positions` still
+  gets the base rows it does not have.
 - Disable with `--no-overrides`, or read them from elsewhere with
   `--overrides-dir DIR`. The build summary reports `overrides=N`.
 
@@ -127,16 +189,19 @@ CONFIG/
 
 For each new AIRAC cycle:
 
-1. Run `python build_navdata.py` → `dist/EG_2610.zip` (cycle 10/26) plus
-   `dist/EG_2610.md` (the release notes).
+1. On a checkout of `main`, run `python build_navdata.py` → `dist/EG_2610.zip`
+   (cycle 10/26) plus `dist/EG_2610.md` (the release notes).
 2. Create a GitHub release; tag it with the cycle, e.g. `airac-2610`.
 3. Upload the ZIP as a release asset and paste `dist/EG_2610.md` into the
    release description.
 
+`python make_airac.py --publish` does steps 2 and 3 with `gh`.
+
 The asset name **includes the cycle** (`EG_2610.zip`), so the name changes every
 cycle — that is intentional. SkyRadar does not use a fixed URL: it queries
 `https://api.github.com/repos/SkyHigh-NOD/SkyHigh-navdata/releases/latest` and
-installs the asset matching `<FIR>_<airac>.zip`. Because of that you only need to
+installs the asset matching `<FIR>_<airac>.zip`, falling back to a single
+`<airac>.zip` (what `make_airac.py --single` builds). Because of that you only need to
 mark each release as **latest**, and multiple FIRs can share one release.
 
 ## Layout of the ZIP
@@ -160,10 +225,12 @@ EG_2610.zip
         ├── AD-entry-exit
         ├── AD-positions
         ├── CTR-positions
+        ├── NOTICE.txt        (with base data)
         ├── airac.txt
         ├── awy.dat
         ├── fix.dat
-        └── navaid.dat
+        ├── navaid.dat
+        └── vfr-points        (with base data)
 ```
 
 SkyRadar refuses to install any file outside `CONFIG/nav/`, `CONFIG/ad/` or

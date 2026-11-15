@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Build the full AIRAC as ONE ZIP and publish it — with a menu.
+"""Menu front end for make_airac.py.
 
     python make_full.py
 
-Shows a menu at the start: a full worldwide build (everything in
-``<cycle>.zip``), single-part regeneration (just airspace, just fixes, ...),
-or picking several parts at once. Any ``make_airac.py`` flag still passes
-through for non-interactive use:
+Shows a menu: a full worldwide build (everything in ``<cycle>.zip``),
+single-part regeneration (just airspace, just fixes, ...), or several parts at
+once. Each choice asks whether to upload the result; only a plain "y" or "yes"
+does. With any argument the menu is skipped and the arguments go to
+``make_airac.py`` exactly as given:
 
-    python make_full.py --no-publish        # build only, no menu prompt for it
-    python make_full.py --only airways      # skips the menu
+    python make_full.py --only airways      # same as: python make_airac.py --only airways
 """
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 MENU = """
-SkyHigh navdata builder - AIRAC {cycle_label}
+SkyHigh navdata builder
 ------------------------------------------------------------
- 1) Full worldwide fresh AIRAC + publish
-      one <cycle>.zip: worldwide airspace, aerodromes, fixes, navaids,
+ 1) Full worldwide fresh AIRAC
+      one <cycle>.zip: worldwide airspace, aerodromes, navaids,
       airways, entry/exit points + worldwide aerodrome layouts
-      (layouts hit the X-Plane Gateway for 40k+ aerodromes - allow hours)
+      (layouts hit the X-Plane Gateway for every aerodrome - allow hours)
  2) Just airspace (skymaps + skyradar)
  3) Just fixes
  4) Just AD positions
@@ -37,17 +37,23 @@ SkyHigh navdata builder - AIRAC {cycle_label}
 """
 
 
-def _ask_cycle_label(code_hint: str) -> str:
-    return code_hint or "(latest release)"
+def publish_args(answer: str) -> list:
+    """Arguments for the answer to "upload?": only a clear yes publishes.
+
+    An empty answer, a typo or anything else builds without uploading. The
+    upload replaces what SkyRadar installs download, so it is never the
+    default.
+    """
+    return ["--publish"] if answer.strip().lower() in ("y", "yes") else []
 
 
-def _prompt_publish(default_yes: bool = True) -> list:
-    answer = input("Publish to GitHub when done? [Y/n]: ").strip().lower()
-    if answer in ("n", "no"):
-        return ["--no-publish"]
-    if default_yes and answer in ("", "y", "yes"):
-        return []
-    return ["--no-publish"] if answer in ("n", "no") else []
+def _prompt_publish() -> list:
+    chosen = publish_args(input("Upload to the GitHub release when done? [y/N]: "))
+    if not chosen:
+        print("Building only. Nothing will be uploaded.")
+        return chosen
+    replace = input("Replace assets already on the release? [y/N]: ")
+    return chosen + (["--clobber"] if replace.strip().lower() in ("y", "yes") else [])
 
 
 def _multi_pick() -> list:
@@ -62,37 +68,33 @@ def _multi_pick() -> list:
     if not chosen:
         return []
     args = ["--only", ",".join(chosen)]
-    if "airspace" in chosen:
-        args += ["--airspace-scope", "world"]
     if "layouts" in chosen:
         spec = input("Layout scope - w)orld or comma-separated ICAO region prefixes "
                      "(e.g. EG,LF) [w]: ").strip()
-        args += ["--layouts", spec or "world"]
+        args += ["--layouts", "world" if spec.lower() in ("", "w", "world") else spec]
     return args
 
 
 def main_menu() -> list:
     """Returns the argv tail for make_airac.main()."""
     while True:
-        print(MENU.format(cycle_label=""))
+        print(MENU)
         choice = input("Choice: ").strip().lower()
         if choice == "1":
-            print("NOTE: worldwide layouts take hours on the first run "
-                  "(cached afterwards only for the eAIP, not the Gateway).")
+            print("NOTE: worldwide layouts take hours.")
             publish = _prompt_publish()
-            return ["--single", "--airspace-scope", "world", "--layouts", "world", *publish]
+            return ["--single", "--layouts", "world", *publish]
         if choice == "2":
-            # world-scope per-country groups (skymaps + skyradar) and the
-            # OAIP-countries map skyradar uses to pick a position's group
+            # the eAIP drawings skymaps reads, plus the per-country openAIP
+            # groups and the OAIP-countries map SkyRadar reads
             publish = _prompt_publish()
-            return ["--only", "airspace", "--airspace-scope", "world", *publish]
+            return ["--only", "airspace", *publish]
         if choice in ("3", "4", "7"):
             part = {"3": "fixes", "4": "ad-positions", "7": "ctr"}[choice]
             publish = _prompt_publish()
             return ["--only", part, *publish]
         if choice == "5":
-            print("NOTE: worldwide layouts take hours on the first run "
-                  "(cached afterwards only for the eAIP, not the Gateway).")
+            print("NOTE: worldwide layouts take hours.")
             publish = _prompt_publish()
             return ["--only", "layouts", "--layouts", "world", *publish]
         if choice == "6":
@@ -114,12 +116,17 @@ def main_menu() -> list:
         print("Pick a number from the menu.\n")
 
 
+def resolve_argv(argv: list) -> list:
+    """The make_airac.py arguments for this run.
+
+    Arguments given on the command line pass through untouched: nothing is
+    added to them, so the asset keeps the name make_airac.py gives it
+    (``EG_<cycle>.zip`` unless ``--single`` was asked for). With none, the
+    menu decides.
+    """
+    return list(argv) if argv else main_menu()
+
+
 if __name__ == "__main__":
-    # any argument = non-interactive: skip the menu entirely
-    if len(sys.argv) > 1:
-        if "--single" not in sys.argv:
-            sys.argv.insert(1, "--single")
-    else:
-        sys.argv = [sys.argv[0], *main_menu()]
     from make_airac import main
-    sys.exit(main())
+    sys.exit(main(resolve_argv(sys.argv[1:])))

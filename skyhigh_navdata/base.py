@@ -9,13 +9,14 @@ sources provide that base, merged *under* the SkyHigh data:
 - **openAIP** (https://www.openaip.net/) publishes anonymous daily exports of
   its whole database at ``https://storage.openaip.net/openaip-system-exports/``
   as per-country ND-GeoJSON files (``gb_apt.ndgeojson`` ...). No API key is
-  needed. We use the airports (``apt``), navaids (``nav``), reporting points
-  (``rpp``) and airspaces (``asp``) exports.
+  needed. We use the airports (``apt``), navaids (``nav``), VFR reporting
+  points (``rpp``) and airspaces (``asp``) exports. The data is licensed
+  CC BY-NC 4.0 and has to be credited wherever it is shipped.
 - **OurAirports** (https://davidmegginson.github.io/ourairports-data/) is the
   worldwide aerodrome database, used as the position fallback for any ICAO
   openAIP does not list.
 
-Both are cached under ``.cache/``: an S3 ETag (openAIP) or a source-control
+Both are cached under ``.cache/``: the LastModified stamp (openAIP) or a source-control
 SHA (OurAirports) decides whether a file needs re-downloading, so a rebuild
 only touches what actually changed.
 """
@@ -26,8 +27,8 @@ import io
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 OPENAIP_EXPORTS_URL = "https://storage.openaip.net/openaip-system-exports/"
@@ -37,6 +38,13 @@ OURAIRPORTS_REPO = "davidmegginson/ourairports-data"
 OURAIRPORTS_CSV = "airports.csv"
 
 USER_AGENT = "skyhigh-navdata base-data fetcher"
+
+# How a manifest names the base data. openAIP's license requires the credit.
+SOURCES = {
+    "openaip": ("openAIP daily exports (https://www.openaip.net), CC BY-NC 4.0: "
+                "airports, navaids, VFR reporting points, airspace"),
+    "ourairports": "OurAirports (https://ourairports.com), public domain: aerodrome positions",
+}
 
 NDGEOJSON_KEY_RE = re.compile(r"^[a-z]{2}_(?:%s)\.ndgeojson$" % "|".join(OPENAIP_TYPES))
 
@@ -62,21 +70,36 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
     ``progress_cb(done, total, label)`` fires per export file when supplied.
 
     Returns a dict with ``airports`` (icao → record), ``navaids``
-    (ident → record), ``fixes`` (name → (lat, lon)) and ``airspaces`` (list),
-    plus a ``counts`` dict.
+    ((ident, country, place) → record), ``vfr_points``
+    ((country, name, place) → (lat, lon)) and ``airspaces`` (list), plus a
+    ``counts`` dict. When the listing cannot be fetched, the exports already
+    in the cache are used; with none cached the error is raised.
     """
     cache_dir = Path(cache_dir)
-    # full listing with LastModified stamps, so unchanged files stay cached
-    listing = _openaip_listing(cache_dir, log)
     cache_path = cache_dir / "openaip.json"
     try:
         cache = json.loads(cache_path.read_text(encoding="utf-8")) if cache_path.is_file() else {}
     except ValueError:
         cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+
+    # full listing with LastModified stamps, so unchanged files stay cached
+    try:
+        listing = _openaip_listing(cache_dir, log)
+    except (urllib.error.URLError, OSError) as error:
+        # The exports already on disk are still good data. Without any, there
+        # is nothing to build the base from and the caller has to know.
+        listing = _cached_listing(cache_dir, cache)
+        if not listing:
+            raise
+        if log:
+            log("openAIP: WARNING - listing unavailable (%s); using %d cached export(s)"
+                % (error, len(listing)))
 
     airports: dict = {}
     navaids: dict = {}
-    fixes: dict = {}
+    vfr_points: dict = {}
     airspaces: list = []
 
     changed = 0
@@ -87,16 +110,20 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
         if progress_cb:
             progress_cb(done, total, key)
         stamp = info.get("last_modified", "")
-        path = cache_dir / "openaip" / key.replace("_", "__")
+        path = _export_path(cache_dir, key)
         if cache.get(key) != stamp or not path.is_file():
-            cache[key] = stamp
             try:
                 _download_to(info["url"], path)
-                changed += 1
             except (urllib.error.URLError, OSError) as error:
+                # The stamp is not recorded, so the next build asks again. An
+                # older copy on disk is still parsed below.
                 if log:
-                    log("openAIP: WARNING - %s download failed (%s); skipped" % (key, error))
-                continue
+                    log("openAIP: WARNING - %s download failed (%s)" % (key, error))
+                if not path.is_file():
+                    continue
+            else:
+                cache[key] = stamp
+                changed += 1
         # Cached files are always parsed: a parse failure in an earlier run
         # must not leave a file downloaded-but-unusable.
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -108,25 +135,40 @@ def load_openaip(cache_dir: Path, log=None, progress_cb=None) -> dict:
                 record = json.loads(line)
             except ValueError:
                 continue
-            _absorb_openaip_record(key, record, airports, navaids, fixes, airspaces)
+            if isinstance(record, dict):
+                _absorb_openaip_record(key, record, airports, navaids, vfr_points, airspaces)
     if changed:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(json.dumps(cache, indent=1, sort_keys=True) + "\n", encoding="utf-8")
     if log:
-        log("openAIP: %d file(s) downloaded, %d airports, %d navaids, %d reporting points, "
-            "%d airspaces" % (changed, len(airports), len(navaids), len(fixes), len(airspaces)))
+        log("openAIP: %d file(s) downloaded, %d airports, %d navaids, %d VFR reporting points, "
+            "%d airspaces" % (changed, len(airports), len(navaids), len(vfr_points), len(airspaces)))
 
     return {
         "airports": airports,
         "navaids": navaids,
-        "fixes": fixes,
+        "vfr_points": vfr_points,
         "airspaces": airspaces,
         "counts": {
             "base_openaip_airports": len(airports),
             "base_openaip_navaids": len(navaids),
-            "base_openaip_fixes": len(fixes),
+            "base_openaip_vfr_points": len(vfr_points),
             "base_openaip_airspaces": len(airspaces),
         },
     }
+
+
+def _export_path(cache_dir: Path, key: str) -> Path:
+    return Path(cache_dir) / "openaip" / key.replace("_", "__")
+
+
+def _cached_listing(cache_dir: Path, cache: dict) -> dict:
+    """The listing rebuilt from exports already downloaded, stamps as recorded."""
+    out = {}
+    for key, stamp in cache.items():
+        if NDGEOJSON_KEY_RE.match(str(key)) and _export_path(cache_dir, key).is_file():
+            out[key] = {"url": OPENAIP_EXPORTS_URL + key, "last_modified": stamp}
+    return out
 
 
 def _openaip_listing(cache_dir: Path, log=None) -> dict:
@@ -159,46 +201,83 @@ def _openaip_listing(cache_dir: Path, log=None) -> dict:
     return out
 
 
-def _absorb_openaip_record(key, record, airports, navaids, fixes, airspaces) -> None:
-    """Fold one ND-GeoJSON feature into the dataset by its export type."""
+ICAO_RE = re.compile(r"^[A-Z]{4}$")
+NAVAID_IDENT_RE = re.compile(r"^[A-Z0-9]{1,5}$")
+
+
+def _point(coordinates):
+    """(lat, lon) from a GeoJSON position, or None when it is not one."""
+    if not isinstance(coordinates, list) or len(coordinates) < 2:
+        return None
+    lon, lat = coordinates[0], coordinates[1]
+    for value in (lat, lon):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    return float(lat), float(lon)
+
+
+def _export_country(key: str, properties: dict) -> str:
+    """ISO country of a record: its own field, else the export file's prefix."""
+    country = str(properties.get("country") or "").upper()
+    if not re.match(r"^[A-Z]{2}$", country):
+        country = key.split("_", 1)[0].upper()
+    return country if re.match(r"^[A-Z]{2}$", country) else "XX"
+
+
+def _absorb_openaip_record(key, record, airports, navaids, vfr_points, airspaces) -> None:
+    """Fold one ND-GeoJSON feature into the dataset by its export type.
+
+    Identities carry the country. Navaid idents and reporting point names
+    repeat around the world and inside one country, so a record is only a
+    repeat of another when the country and the place agree as well.
+    """
     kind = key.split("_", 1)[1].split(".", 1)[0]
     properties = record.get("properties") or {}
     geometry = record.get("geometry") or {}
     coordinates = geometry.get("coordinates")
+    country = _export_country(key, properties)
     if kind == "apt":
-        icao = str(properties.get("icaoCode") or "").upper()
-        if not re.match(r"^[A-Z0-9]{4}$", icao) or icao in airports:
-            return
-        if not isinstance(coordinates, list) or len(coordinates) < 2:
+        icao = str(properties.get("icaoCode") or "").upper().strip()
+        point = _point(coordinates)
+        # Only real ICAO location indicators. Local idents with digits in them
+        # are not ICAO codes and would turn into regions of their own.
+        if not ICAO_RE.match(icao) or icao in airports or point is None:
             return
         airports[icao] = {
-            "lat": coordinates[1],
-            "lon": coordinates[0],
+            "lat": point[0],
+            "lon": point[1],
             "name": str(properties.get("name") or icao).strip() or icao,
-            "country": str(properties.get("country") or ""),
+            "country": country,
         }
     elif kind == "nav":
-        ident = str(properties.get("identifier") or "").upper()
-        if not ident or ident in navaids:
+        ident = str(properties.get("identifier") or "").upper().strip()
+        point = _point(coordinates)
+        if not NAVAID_IDENT_RE.match(ident) or point is None:
             return
-        if not isinstance(coordinates, list) or len(coordinates) < 2:
+        # Two navaids with one ident in one country are kept apart by place.
+        identity = (ident, country, round(point[0], 1), round(point[1], 1))
+        if identity in navaids:
             return
-        navaids[ident] = {
-            "lat": coordinates[1],
-            "lon": coordinates[0],
+        navaids[identity] = {
+            "ident": ident,
+            "lat": point[0],
+            "lon": point[1],
             "name": str(properties.get("name") or ident).strip() or ident,
             "type": _openaip_nav_row_type(properties.get("type")),
             "freq": re.sub(r"[^0-9.]", "", str((properties.get("frequency") or {}).get("value") or "")) or "0",
-            "elev_ft": _altitude_ft(properties.get("elevation")),
-            "region": str(properties.get("country") or "").upper() or "XX",
+            "elev_ft": _altitude_ft(properties.get("elevation")) or 0,
+            "region": country,
         }
     elif kind == "rpp":
-        name = str(properties.get("name") or "").upper().strip()
-        if not name or name in fixes:
+        name = " ".join(str(properties.get("name") or "").upper().split())
+        point = _point(coordinates)
+        if not name or point is None:
             return
-        if not isinstance(coordinates, list) or len(coordinates) < 2:
-            return
-        fixes[name] = (coordinates[1], coordinates[0])
+        # The same name at another place in the country is another point
+        # (France has dozens of points called "N", one per aerodrome).
+        vfr_points[(country, name, round(point[0], 4), round(point[1], 4))] = point
     elif kind == "asp":
         rings = _polygon_rings(coordinates)
         if not rings:
@@ -260,11 +339,11 @@ def _altitude_text(limit) -> str:
 def _polygon_rings(coordinates):
     """GeoJSON Polygon/MultiPolygon coordinates → [outer ring [(lat, lon)]] ."""
     polygons = []
-    if not isinstance(coordinates, list):
+    if not isinstance(coordinates, list) or not coordinates:
         return polygons
     if geometry_is_multipolygon(coordinates):
         for polygon in coordinates:
-            if polygon and isinstance(polygon[0], list):
+            if isinstance(polygon, list) and polygon and isinstance(polygon[0], list):
                 polygons.append(polygon[0])
     else:
         polygons.append(coordinates[0])
@@ -289,11 +368,50 @@ def geometry_is_multipolygon(coordinates) -> bool:
 
 # --- OurAirports -------------------------------------------------------------
 
+def ourairports_icao(row: dict) -> str:
+    """The ICAO location indicator of an OurAirports row, or "".
+
+    ``ident`` is not one: it holds a local identifier (``00AK``, ``01CA``)
+    whenever the aerodrome has no ICAO code. ``icao_code`` is the real column;
+    ``gps_code`` stands in for it only when it has the shape of an ICAO code.
+    """
+    for column in ("icao_code", "gps_code"):
+        code = str(row.get(column) or "").upper().strip()
+        if ICAO_RE.match(code):
+            return code
+    return ""
+
+
+def parse_ourairports_csv(text: str) -> dict:
+    """``icao -> {lat, lon, name, country}`` for every open aerodrome with an ICAO code."""
+    airports: dict = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        icao = ourairports_icao(row)
+        if not icao or icao in airports:
+            continue
+        if str(row.get("type") or "") == "closed":
+            continue
+        try:
+            lat = float(row["latitude_deg"])
+            lon = float(row["longitude_deg"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            continue
+        airports[icao] = {
+            "lat": lat,
+            "lon": lon,
+            "name": str(row.get("name") or icao).strip() or icao,
+            "country": str(row.get("iso_country") or "").upper(),
+        }
+    return airports
+
+
 def load_ourairports(cache_dir: Path, log=None) -> dict:
     """Download (SHA-cached) and parse the OurAirports CSV.
 
-    Returns ``icao → {lat, lon, name, country}`` for every non-closed entry
-    with a usable 4-character ident.
+    Returns ``{"airports": icao → {lat, lon, name, country}, "counts": ...}``
+    for every non-closed entry with an ICAO code.
     """
     cache_dir = Path(cache_dir)
     cache_path = cache_dir / "ourairports.json"
@@ -336,25 +454,8 @@ def load_ourairports(cache_dir: Path, log=None) -> dict:
     if not csv_path.is_file():
         return {"airports": {}, "counts": {"base_ourairports_airports": 0}}
 
-    airports: dict = {}
     text = csv_path.read_text(encoding="utf-8", errors="replace")
-    for row in csv.DictReader(io.StringIO(text)):
-        ident = str(row.get("ident") or "").upper()
-        if not re.match(r"^[A-Z0-9]{4}$", ident) or ident in airports:
-            continue
-        if str(row.get("type") or "") == "closed":
-            continue
-        try:
-            lat = float(row["latitude_deg"])
-            lon = float(row["longitude_deg"])
-        except (KeyError, ValueError):
-            continue
-        airports[ident] = {
-            "lat": lat,
-            "lon": lon,
-            "name": str(row.get("name") or ident).strip() or ident,
-            "country": str(row.get("iso_country") or ""),
-        }
+    airports = parse_ourairports_csv(text)
     if log:
         log("OurAirports: %d aerodromes parsed" % len(airports))
     return {

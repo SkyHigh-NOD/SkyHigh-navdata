@@ -13,6 +13,8 @@ from urllib.error import HTTPError
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
+from .pack import safe_extract
+
 NATS_AIP_URL = "https://nats-uk.ead-it.com/cms-nats/opencms/en/Publications/AIP/"
 GATEWAY_API_BASE = "https://gateway.x-plane.com/apiv1"
 GATEWAY_WEB_BASE = "https://gateway.x-plane.com"
@@ -28,12 +30,30 @@ def download_file(url: str, destination: Path, timeout: int = 120,
                   progress_cb=None) -> None:
     """Stream a URL to disk. ``progress_cb(bytes_done, bytes_total)`` fires per
     chunk when supplied. When the server omits Content-Length on the GET, a
-    HEAD request fills the gap; 0 means genuinely unknown."""
+    HEAD request fills the gap for the progress display; 0 means genuinely
+    unknown. Nobody reads the total without a callback, so no HEAD is sent
+    then.
+
+    The body goes to a ``.part`` file that only takes the destination's name
+    once it is complete, so an interrupted download never looks like a file.
+    """
+    destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urlopen(request_url(url), timeout=timeout) as response, destination.open("wb") as output:
+    partial = destination.with_name(destination.name + ".part")
+    try:
+        _stream_to(url, partial, timeout, progress_cb)
+        os.replace(partial, destination)
+    finally:
+        if partial.exists():
+            partial.unlink()
+
+
+def _stream_to(url: str, partial: Path, timeout: int, progress_cb) -> None:
+    with urlopen(request_url(url), timeout=timeout) as response, partial.open("wb") as output:
         total_header = response.headers.get("Content-Length")
         total = int(total_header) if total_header and total_header.isdigit() else 0
-        if not total:
+        declared = total
+        if not total and progress_cb:
             try:
                 with urlopen(Request(url, headers={"User-Agent": USER_AGENT},
                                      method="HEAD"), timeout=30) as head:
@@ -51,6 +71,8 @@ def download_file(url: str, destination: Path, timeout: int = 120,
             done += len(chunk)
             if progress_cb:
                 progress_cb(done, total)
+        if declared and done < declared:
+            raise OSError("download stopped at %d of %d bytes" % (done, declared))
 
 
 # --- NATS UK eAIP -----------------------------------------------------------
@@ -64,6 +86,32 @@ def find_current_nats_airac():
     if not cycle or not archive:
         raise RuntimeError("Could not find the current NATS AIRAC ZIP download link.")
     return "%s/%s" % (cycle.group(1), cycle.group(2)[-2:]), urljoin(NATS_AIP_URL, archive.group(1))
+
+
+def archive_source_path(archive_path: Path) -> Path:
+    """Where the URL a cached archive was downloaded from is recorded."""
+    archive_path = Path(archive_path)
+    return archive_path.with_name(archive_path.name + ".source")
+
+
+def cached_archive_usable(archive_path: Path, zip_url: str) -> bool:
+    """True when the cached archive is complete and is the one at ``zip_url``.
+
+    The NATS link names the cycle (``AIRAC-10-26.zip``), so an archive whose
+    recorded URL differs holds another cycle's data. One with no record, or
+    one that does not open as a ZIP, is not trusted either.
+    """
+    archive_path = Path(archive_path)
+    source_note = archive_source_path(archive_path)
+    if not archive_path.is_file() or not source_note.is_file():
+        return False
+    try:
+        if source_note.read_text(encoding="utf-8").strip() != zip_url:
+            return False
+        with zipfile.ZipFile(archive_path) as archive:
+            return bool(archive.namelist())
+    except (zipfile.BadZipFile, OSError):
+        return False
 
 
 def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tuple[str, Path]:
@@ -80,27 +128,25 @@ def download_and_extract_airac(dest_dir: Path, log=None, progress_cb=None) -> tu
     html_dir = dest_dir / "html"
     archive_path = dest_dir / "nats-airac.zip"
 
-    # A previous run may already have pulled the (very large) archive down;
-    # a complete ZIP's central directory lives at the end of the file, so a
-    # truncated download fails this check and gets re-downloaded.
-    if archive_path.is_file() and archive_path.stat().st_size > 10_000_000:
-        try:
-            with zipfile.ZipFile(archive_path) as archive:
-                archive.namelist()
+    if cached_archive_usable(archive_path, zip_url):
+        if log:
+            log("Found the NATS ZIP for this cycle (%.0f MB) - reusing it, no download."
+                % (archive_path.stat().st_size / 1e6))
+    else:
+        if archive_path.exists():
             if log:
-                log("Found the existing NATS ZIP (%.0f MB) - reusing it, no download."
-                    % (archive_path.stat().st_size / 1e6))
-        except (zipfile.BadZipFile, OSError):
-            if log:
-                log("Existing NATS ZIP is incomplete - re-downloading.")
+                log("The cached NATS ZIP is incomplete or from another cycle - downloading again.")
             archive_path.unlink()
-    if not archive_path.is_file():
+        source_note = archive_source_path(archive_path)
+        if source_note.exists():
+            source_note.unlink()
         download_file(zip_url, archive_path, progress_cb=progress_cb)
+        source_note.write_text(zip_url + "\n", encoding="utf-8")
     if html_dir.exists():
         shutil.rmtree(html_dir)
     html_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archive_path) as archive:
-        archive.extractall(html_dir)
+        safe_extract(archive, html_dir)
     if log:
         log("Extracted AIRAC archive to %s" % html_dir)
     return cycle, html_dir
